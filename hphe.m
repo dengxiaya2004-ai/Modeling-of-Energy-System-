@@ -9,9 +9,9 @@ clc; clear; close all;
 %% ── 1. PARAMETERS 系统参数 ───────────────────────────────
 
 % Temperature settings 温度设定
-T_hot_HP  = 150 + 273.15;   % Heat pump output temp [K] 热泵出口温度
+T_hot_HP  = 157 + 273.15;   % Heat pump output temp [K] 热泵出口温度
 T_cold_HP = 70  + 273.15;   % Heat pump input (waste heat) [K] 废热温度
-T_hot_HE  = 150 + 273.15;   % Heat engine hot side [K] 热机高温侧
+T_hot_HE  = 157 + 273.15;   % Heat engine hot side [K] 热机高温侧
 T_cold_HE = 40  + 273.15;   % Heat engine cold side (ambient) [K] 冷侧
 
 % Carnot efficiency correction factor
