@@ -21,7 +21,7 @@ epsilon_HE = 0.2;           % Heat engine Carnot correction 热机修正系数
 
 % Industrial demand 工业热需求
 P_demand   = 10e6;           % need ST peak thermal power
-t_op       = 10;             % Operating hours per day [h]
+t_op       = 24;             % Operating hours per day [h]
 
 % Waste heat availability 废热参数
 Q_waste_max = 5e6;           % Max available waste heat [W] = 5 MW
