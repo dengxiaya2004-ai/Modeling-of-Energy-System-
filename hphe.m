@@ -20,7 +20,7 @@ epsilon_HP = 0.5;           % Heat pump Carnot correction 热泵修正系数
 epsilon_HE = 0.2;           % Heat engine Carnot correction 热机修正系数
 
 % Industrial demand 工业热需求
-P_demand   = 10e6;           % need ST peak thermal power
+P_demand   = 10e6;          
 t_op       = 24;             % Operating hours per day [h]
 
 % Waste heat availability 废热参数
