@@ -1,225 +1,217 @@
-import numpy as np
+import math
+from dataclasses import dataclass
+from typing import List, Optional, Tuple, Dict, Any
 
 
-# =========================
-# 1. ELECTRIC HEATER CLASS
-# =========================
+@dataclass
+class HeaterGridConfig:
+    """Configuration for electric-heater + grid backup section."""
+
+    heater_p_max_mw: float = 10.0
+    heater_efficiency: float = 0.99
+    grid_import_max_mw: float = float("inf")
+
+    weekday_start_hour: int = 8
+    weekday_end_hour: int = 18   # exclusive
+    weekend_start_hour: int = 0
+    weekend_end_hour: int = 0    # exclusive; 0->0 means no weekend operation
+
+    weekday_peak_start_hour: int = 8
+    weekday_peak_end_hour: int = 20
+    weekday_peak_price_eur_per_mwh: float = 140.0
+    weekday_offpeak_price_eur_per_mwh: float = 70.0
+
+    weekend_peak_start_hour: int = 10
+    weekend_peak_end_hour: int = 18
+    weekend_peak_price_eur_per_mwh: float = 110.0
+    weekend_offpeak_price_eur_per_mwh: float = 60.0
+
+
 class ElectricHeater:
-    """
-    Electric Heater model
-    Converts electricity (MW_el) into heat (MW_th)
-    """
+    """Converts electricity (MW_el) into heat (MW_th)."""
 
-    def __init__(self, P_max, efficiency=0.99):
-        self.P_max = P_max  # Maximum electrical input [MW]
-        self.efficiency = efficiency  # Conversion efficiency
+    def __init__(self, p_max_mw: float, efficiency: float = 0.99):
+        self.p_max_mw = p_max_mw
+        self.efficiency = efficiency
 
-    def dispatch(self, heat_demand, available_power):
-        """
-        Determine heater output based on demand and available electricity
+    def dispatch(self, heat_demand_mw: float, available_power_mw: float) -> Tuple[float, float]:
+        q_max_mw = self.p_max_mw * self.efficiency
+        q_eh_mw = min(heat_demand_mw, q_max_mw)
+        p_eh_mw = q_eh_mw / self.efficiency
 
-        Parameters:
-        heat_demand : float [MW_th]
-        available_power : float [MW_el]
+        if p_eh_mw > available_power_mw:
+            p_eh_mw = available_power_mw
+            q_eh_mw = p_eh_mw * self.efficiency
 
-        Returns:
-        P_eh : electricity used [MW_el]
-        Q_eh : heat produced [MW_th]
-        """
-
-        # Maximum heat the heater can produce
-        Q_max = self.P_max * self.efficiency
-
-        # Step 1: meet demand within capacity
-        Q_eh = min(heat_demand, Q_max)
-
-        # Convert heat to required electricity
-        P_eh = Q_eh / self.efficiency
-
-        # Step 2: check if enough power is available
-        if P_eh > available_power:
-            P_eh = available_power
-            Q_eh = P_eh * self.efficiency
-
-        return P_eh, Q_eh
+        return p_eh_mw, q_eh_mw
 
 
-# =========================
-# 2. GRID MODEL
-# =========================
 class Grid:
-    """
-    Grid model for electricity import
-    """
+    """Grid model for import-limited electricity purchase."""
 
-    def __init__(self, price_import, P_max_import=np.inf):
-        self.price_import = price_import  # €/MWh
-        self.P_max_import = P_max_import  # MW
+    def __init__(self, price_import_eur_per_mwh: List[float], p_max_import_mw: float = float("inf")):
+        self.price_import_eur_per_mwh = price_import_eur_per_mwh
+        self.p_max_import_mw = p_max_import_mw
 
-    def import_power(self, demand):
-        """Limit grid import by capacity"""
-        return min(demand, self.P_max_import)
+    def import_power(self, demand_mw: float) -> float:
+        return min(demand_mw, self.p_max_import_mw)
 
-    def compute_cost(self, P_grid, t):
-        """Electricity cost at timestep t"""
-        return P_grid * self.price_import[t]
+    def compute_cost(self, p_grid_mw: float, t: int) -> float:
+        return p_grid_mw * self.price_import_eur_per_mwh[t]
 
 
-# =========================
-# 3. LOAD PROFILE (INDUSTRIAL)
-# =========================
-def generate_heat_demand(time_steps):
-    """
-    Industrial heat demand:
-    10 MW during working hours (8:00–18:00)
-    0 MW otherwise
-    """
+def build_is_weekend(time_steps: int, monday_as_day1: bool = True) -> List[bool]:
+    """Return a bool vector where weekend=True for Sat/Sun."""
+    if not monday_as_day1:
+        raise NotImplementedError("Current implementation assumes day-1 is Monday.")
 
-    hours = np.arange(time_steps) % 24
-    heat_demand = np.zeros(time_steps)
+    is_weekend = [False] * time_steps
+    for t in range(time_steps):
+        day_index = t // 24
+        weekday_idx = day_index % 7  # 0..6 => Mon..Sun
+        is_weekend[t] = weekday_idx >= 5
+    return is_weekend
 
-    # Working hours: 8:00–18:00 (10 hours)
-    heat_demand[(hours >= 8) & (hours < 18)] = 10
 
+def build_operating_schedule(time_steps: int, config: HeaterGridConfig) -> List[bool]:
+    """Operating hours mask with weekday/weekend distinction."""
+    is_weekend = build_is_weekend(time_steps)
+    schedule = [False] * time_steps
+
+    for t in range(time_steps):
+        hour = t % 24
+        if is_weekend[t]:
+            schedule[t] = config.weekend_start_hour <= hour < config.weekend_end_hour
+        else:
+            schedule[t] = config.weekday_start_hour <= hour < config.weekday_end_hour
+
+    return schedule
+
+
+def generate_heat_demand(time_steps: int, demand_mw: float, config: HeaterGridConfig) -> List[float]:
+    """Industrial heat demand with different weekday/weekend working windows."""
+    schedule = build_operating_schedule(time_steps, config)
+    heat_demand = [0.0] * time_steps
+    for t in range(time_steps):
+        if schedule[t]:
+            heat_demand[t] = demand_mw
     return heat_demand
 
 
-# =========================
-# 4. ELECTRICITY PRICE (ITALY TOU)
-# =========================
-def generate_electricity_price(time_steps):
-    """
-    Italian-style Time-of-Use electricity price
+def generate_electricity_price(time_steps: int, config: HeaterGridConfig) -> List[float]:
+    """TOU electricity price with weekday/weekend differentiation."""
+    is_weekend = build_is_weekend(time_steps)
+    price = [config.weekday_offpeak_price_eur_per_mwh] * time_steps
 
-    Daytime (08:00–20:00): high price
-    Nighttime: low price
-    """
+    for t in range(time_steps):
+        hour = t % 24
 
-    hours = np.arange(time_steps) % 24
-
-    price = np.where(
-        (hours >= 8) & (hours < 20),
-        140,   # €/MWh (day)
-        70     # €/MWh (night)
-    )
+        if is_weekend[t]:
+            price[t] = config.weekend_offpeak_price_eur_per_mwh
+            if config.weekend_peak_start_hour <= hour < config.weekend_peak_end_hour:
+                price[t] = config.weekend_peak_price_eur_per_mwh
+        else:
+            if config.weekday_peak_start_hour <= hour < config.weekday_peak_end_hour:
+                price[t] = config.weekday_peak_price_eur_per_mwh
 
     return price
 
 
-# =========================
-# 5. PV GENERATION (SIMPLE)
-# =========================
-def generate_pv_profile(time_steps, peak_power=4):
-    """
-    Simple synthetic PV profile (daytime only)
-    """
-
-    hours = np.arange(time_steps) % 24
-
-    # PV only produces during daytime
-    pv = peak_power * np.maximum(0, np.sin(np.pi * (hours - 6) / 12))
-
+def generate_pv_profile(time_steps: int, peak_power_mw: float = 4.0) -> List[float]:
+    pv = [0.0] * time_steps
+    for t in range(time_steps):
+        hour = t % 24
+        pv[t] = peak_power_mw * max(0.0, math.sin(math.pi * (hour - 6) / 12))
     return pv
 
 
-# =========================
-# 6. MAIN SIMULATION
-# =========================
-def simulate_system(time_steps,
-                    heat_demand,
-                    pv_power_dc,
-                    electricity_price,
-                    heater,
-                    grid,
-                    inverter_efficiency=0.97):
+def simulate_electric_heater_grid_section(
+    heat_demand_mw: List[float],
+    pv_power_dc_mw: List[float],
+    electricity_price_eur_per_mwh: List[float],
+    config: HeaterGridConfig,
+    inverter_efficiency: float = 0.97,
+    external_power_limit_mw: Optional[List[float]] = None,
+) -> Dict[str, Any]:
+    """
+    Reusable electric-heater + grid function for main simulation cascade.
 
-    # Convert PV from DC to AC
-    pv_power_ac = pv_power_dc * inverter_efficiency
+    external_power_limit_mw: optional vector for other modules to cap available electric power.
+    """
 
-    # Initialize result arrays
-    P_EH = np.zeros(time_steps)
-    Q_EH = np.zeros(time_steps)
-    P_grid = np.zeros(time_steps)
-    cost = np.zeros(time_steps)
+    time_steps = len(heat_demand_mw)
+    if len(pv_power_dc_mw) != time_steps or len(electricity_price_eur_per_mwh) != time_steps:
+        raise ValueError("heat demand, PV profile and price profile must have same length")
+
+    is_operating = build_operating_schedule(time_steps, config)
+    is_weekend = build_is_weekend(time_steps)
+
+    if external_power_limit_mw is None:
+        external_power_limit_mw = [float("inf")] * time_steps
+    elif len(external_power_limit_mw) != time_steps:
+        raise ValueError("external_power_limit_mw length must match heat demand")
+
+    heater = ElectricHeater(config.heater_p_max_mw, config.heater_efficiency)
+    grid = Grid(electricity_price_eur_per_mwh, config.grid_import_max_mw)
+
+    p_eh_total_mw = [0.0] * time_steps
+    q_eh_mw = [0.0] * time_steps
+    p_grid_mw = [0.0] * time_steps
+    cost_eur = [0.0] * time_steps
+    q_residual_mw = [0.0] * time_steps
 
     for t in range(time_steps):
+        demand_t = heat_demand_mw[t] if is_operating[t] else 0.0
+        pv_power_ac_t = pv_power_dc_mw[t] * inverter_efficiency
+        available_pv_t = min(pv_power_ac_t, external_power_limit_mw[t])
 
-        # Available PV power
-        available_pv = pv_power_ac[t]
+        p_eh_from_pv_t, q_eh_t = heater.dispatch(demand_t, available_pv_t)
 
-        # Step 1: use PV first
-        P_eh_pv, Q_eh = heater.dispatch(
-            heat_demand[t],
-            available_pv
-        )
-
-        # Remaining heat demand
-        remaining_heat = heat_demand[t] - Q_eh
-
-        # Step 2: use grid if needed
+        remaining_heat = demand_t - q_eh_t
         if remaining_heat > 0:
-
-            # Convert heat demand to electricity
-            P_needed = remaining_heat / heater.efficiency
-
-            # Import from grid
-            P_grid_t = grid.import_power(P_needed)
-
-            # Convert to heat
-            Q_extra = P_grid_t * heater.efficiency
-
-            # Update totals
-            Q_eh += Q_extra
-            P_eh_total = P_eh_pv + P_grid_t
-
+            p_needed_grid_t = remaining_heat / heater.efficiency
+            p_grid_t = grid.import_power(p_needed_grid_t)
+            q_extra = p_grid_t * heater.efficiency
+            q_eh_t += q_extra
+            p_eh_t = p_eh_from_pv_t + p_grid_t
         else:
-            P_grid_t = 0
-            P_eh_total = P_eh_pv
+            p_grid_t = 0.0
+            p_eh_t = p_eh_from_pv_t
 
-        # Step 3: compute cost
-        cost_t = grid.compute_cost(P_grid_t, t)
-
-        # Store results
-        P_EH[t] = P_eh_total
-        Q_EH[t] = Q_eh
-        P_grid[t] = P_grid_t
-        cost[t] = cost_t
+        p_eh_total_mw[t] = p_eh_t
+        q_eh_mw[t] = q_eh_t
+        p_grid_mw[t] = p_grid_t
+        cost_eur[t] = grid.compute_cost(p_grid_t, t)
+        q_residual_mw[t] = max(heat_demand_mw[t] - q_eh_t, 0.0)
 
     return {
-        "P_EH": P_EH,
-        "Q_EH": Q_EH,
-        "P_grid": P_grid,
-        "cost": cost,
-        "total_cost": np.sum(cost)
+        "P_EH_MW": p_eh_total_mw,
+        "Q_EH_MW": q_eh_mw,
+        "P_grid_MW": p_grid_mw,
+        "cost_EUR": cost_eur,
+        "Q_residual_MW": q_residual_mw,
+        "is_operating": is_operating,
+        "is_weekend": is_weekend,
+        "electricity_price_EUR_per_MWh": electricity_price_eur_per_mwh,
+        "total_cost_EUR": sum(cost_eur),
     }
 
 
-# =========================
-# 7. RUN SIMULATION
-# =========================
 if __name__ == "__main__":
+    cfg = HeaterGridConfig()
+    n = 8760
 
-    time_steps = 8760
+    heat = generate_heat_demand(time_steps=n, demand_mw=10.0, config=cfg)
+    price = generate_electricity_price(time_steps=n, config=cfg)
+    pv = generate_pv_profile(time_steps=n, peak_power_mw=4.0)
 
-    # Generate profiles
-    heat_demand = generate_heat_demand(time_steps)
-    electricity_price = generate_electricity_price(time_steps)
-    pv_power_dc = generate_pv_profile(time_steps)
-
-    # Create system components
-    heater = ElectricHeater(P_max=10)
-    grid = Grid(price_import=electricity_price)
-
-    # Run simulation
-    results = simulate_system(
-        time_steps,
-        heat_demand,
-        pv_power_dc,
-        electricity_price,
-        heater,
-        grid
+    result = simulate_electric_heater_grid_section(
+        heat_demand_mw=heat,
+        pv_power_dc_mw=pv,
+        electricity_price_eur_per_mwh=price,
+        config=cfg,
     )
 
-    # Print results
-    print("Total yearly cost (€):", results["total_cost"])
-    print("Average grid import (MW):", np.mean(results["P_grid"]))
+    avg_grid = sum(result["P_grid_MW"]) / len(result["P_grid_MW"]) if result["P_grid_MW"] else 0.0
+    print(f"Total yearly grid cost (EUR): {result['total_cost_EUR']:.2f}")
+    print(f"Average grid import (MW): {avg_grid:.3f}")
