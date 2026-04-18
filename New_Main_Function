@@ -1,0 +1,83 @@
+"""Python main simulation entrypoint.
+
+This script demonstrates how to call the electric-heater + grid section as a
+reusable function inside a larger cascade simulation.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+
+
+def load_heater_grid_module():
+    module_path = Path(__file__).with_name("electric heater& grid.py")
+    spec = importlib.util.spec_from_file_location("electric_heater_grid", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load module from {module_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def mock_solar_tes_stage(q_demand_mw):
+    """Placeholder interface for upstream modules (STC + TES / HP / etc.)."""
+    q_from_upstream_mw = [0.0] * len(q_demand_mw)
+    q_residual_mw = [max(d - q, 0.0) for d, q in zip(q_demand_mw, q_from_upstream_mw)]
+    return q_from_upstream_mw, q_residual_mw
+
+
+def run_main_simulation(time_steps: int = 8760):
+    ehg = load_heater_grid_module()
+
+    cfg = ehg.HeaterGridConfig(
+        heater_p_max_mw=10.0,
+        heater_efficiency=0.99,
+        weekday_start_hour=8,
+        weekday_end_hour=18,
+        weekend_start_hour=0,
+        weekend_end_hour=0,
+        weekday_peak_price_eur_per_mwh=140.0,
+        weekday_offpeak_price_eur_per_mwh=70.0,
+        weekend_peak_price_eur_per_mwh=110.0,
+        weekend_offpeak_price_eur_per_mwh=60.0,
+    )
+
+    q_demand_mw = ehg.generate_heat_demand(time_steps, demand_mw=10.0, config=cfg)
+    electricity_price = ehg.generate_electricity_price(time_steps, config=cfg)
+    pv_power_dc = ehg.generate_pv_profile(time_steps, peak_power_mw=4.0)
+
+    q_upstream_mw, q_residual_mw = mock_solar_tes_stage(q_demand_mw)
+
+    eh_results = ehg.simulate_electric_heater_grid_section(
+        heat_demand_mw=q_residual_mw,
+        pv_power_dc_mw=pv_power_dc,
+        electricity_price_eur_per_mwh=electricity_price,
+        config=cfg,
+    )
+
+    q_unserved_mw = eh_results["Q_residual_MW"]
+
+    summary = {
+        "time_steps": time_steps,
+        "E_demand_MWh": sum(q_demand_mw),
+        "E_upstream_MWh": sum(q_upstream_mw),
+        "E_EH_MWh": sum(eh_results["Q_EH_MW"]),
+        "E_unserved_MWh": sum(q_unserved_mw),
+        "total_grid_cost_EUR": eh_results["total_cost_EUR"],
+    }
+
+    return summary, eh_results
+
+
+if __name__ == "__main__":
+    summary, _ = run_main_simulation(8760)
+
+    print("=== Python Main Simulation Summary ===")
+    print(f"Time steps: {summary['time_steps']}")
+    print(f"Total demand (MWh): {summary['E_demand_MWh']:.1f}")
+    print(f"Upstream covered (MWh): {summary['E_upstream_MWh']:.1f}")
+    print(f"Electric heater covered (MWh): {summary['E_EH_MWh']:.1f}")
+    print(f"Unserved residual (MWh): {summary['E_unserved_MWh']:.1f}")
+    print(f"Total grid cost (EUR): {summary['total_grid_cost_EUR']:.2f}")
