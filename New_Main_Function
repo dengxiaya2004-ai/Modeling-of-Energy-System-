@@ -1,17 +1,30 @@
-"""Python main simulation entrypoint.
+"""
+Main simulation + optimization entrypoint
+主函数：系统仿真 + 自动优化（寻找最优容量配置）
 
-This script demonstrates how to call the electric-heater + grid section as a
-reusable function inside a larger cascade simulation.
+Goal:
+Find optimal capacity allocation for ST / TES / HP / EH
+目标：找到最经济的容量配置方案
 """
 
 from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import numpy as np
+from scipy.optimize import minimize
 
 
+# =========================================================
+# 1. LOAD ELECTRIC HEATER + GRID MODULE
+# =========================================================
 def load_heater_grid_module():
+    """
+    Dynamically load the electric heater module
+    动态加载 electric heater & grid 模块
+    """
     module_path = Path(__file__).with_name("electric heater& grid.py")
+
     spec = importlib.util.spec_from_file_location("electric_heater_grid", module_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load module from {module_path}")
@@ -21,63 +34,196 @@ def load_heater_grid_module():
     return module
 
 
-def mock_solar_tes_stage(q_demand_mw):
-    """Placeholder interface for upstream modules (STC + TES / HP / etc.)."""
-    q_from_upstream_mw = [0.0] * len(q_demand_mw)
-    q_residual_mw = [max(d - q, 0.0) for d, q in zip(q_demand_mw, q_from_upstream_mw)]
-    return q_from_upstream_mw, q_residual_mw
+# =========================================================
+# 2. PLACEHOLDER: UPSTREAM MODULE (ST / TES / HP)
+# =========================================================
+def mock_upstream_system(q_demand_mw):
+    """
+    Placeholder for ST / TES / HP
+    上游模块占位（未来可替换为真实模型）
+
+    Currently:
+    - No heat supplied upstream
+    - All demand goes to EH
+    当前：不提供热量（全部交给EH）
+    """
+    q_upstream = [0.0] * len(q_demand_mw)
+
+    # Remaining heat demand
+    # 剩余热需求
+    q_residual = [max(d - q, 0.0) for d, q in zip(q_demand_mw, q_upstream)]
+
+    return q_upstream, q_residual
 
 
-def run_main_simulation(time_steps: int = 8760):
-    ehg = load_heater_grid_module()
+# =========================================================
+# 3. SYSTEM EVALUATION FUNCTION（核心！）
+# =========================================================
+def evaluate_system(design, ehg, time_steps=8760):
+    """
+    Evaluate one system design
+    评估一个系统方案的经济性
 
+    Parameters:
+        design: dict with capacities
+        design: 包含 ST/TES/HP/EH 容量的字典
+
+    Returns:
+        total_cost: float
+    """
+
+    # -----------------------------
+    # 3.1 UNPACK DESIGN VARIABLES
+    # -----------------------------
+    ST = design["ST"]   # Solar thermal capacity
+    TES = design["TES"] # Thermal storage capacity
+    HP = design["HP"]   # Heat pump capacity
+    EH = design["EH"]   # Electric heater capacity
+
+    # Avoid invalid solutions（避免负数）
+    if min([ST, TES, HP, EH]) < 0:
+        return 1e20
+
+    # -----------------------------
+    # 3.2 BUILD CONFIG
+    # -----------------------------
+    # 将设计变量写入系统配置
     cfg = ehg.HeaterGridConfig(
-        heater_p_max_mw=10.0,
-        heater_efficiency=0.99,
-        weekday_start_hour=8,
-        weekday_end_hour=18,
-        weekend_start_hour=0,
-        weekend_end_hour=0,
-        weekday_peak_price_eur_per_mwh=140.0,
-        weekday_offpeak_price_eur_per_mwh=70.0,
-        weekend_peak_price_eur_per_mwh=110.0,
-        weekend_offpeak_price_eur_per_mwh=60.0,
+        heater_p_max_mw=EH
     )
 
-    q_demand_mw = ehg.generate_heat_demand(time_steps, demand_mw=10.0, config=cfg)
-    electricity_price = ehg.generate_electricity_price(time_steps, config=cfg)
-    pv_power_dc = ehg.generate_pv_profile(time_steps, peak_power_mw=4.0)
+    # -----------------------------
+    # 3.3 GENERATE PROFILES
+    # -----------------------------
+    # 生成全年数据（负荷、电价、PV）
+    heat_demand = ehg.generate_heat_demand(time_steps, demand_mw=10.0, config=cfg)
+    price = ehg.generate_electricity_price(time_steps, config=cfg)
+    pv = ehg.generate_pv_profile(time_steps, peak_power_mw=4.0)
 
-    q_upstream_mw, q_residual_mw = mock_solar_tes_stage(q_demand_mw)
+    # -----------------------------
+    # 3.4 UPSTREAM SYSTEM
+    # -----------------------------
+    # 上游系统（未来替换 ST/TES/HP）
+    q_upstream, q_residual = mock_upstream_system(heat_demand)
 
-    eh_results = ehg.simulate_electric_heater_grid_section(
-        heat_demand_mw=q_residual_mw,
-        pv_power_dc_mw=pv_power_dc,
-        electricity_price_eur_per_mwh=electricity_price,
+    # -----------------------------
+    # 3.5 ELECTRIC HEATER + GRID
+    # -----------------------------
+    # 下游模块（你负责的部分）
+    results = ehg.simulate_electric_heater_grid_section(
+        heat_demand_mw=q_residual,
+        pv_power_dc_mw=pv,
+        electricity_price_eur_per_mwh=price,
         config=cfg,
     )
 
-    q_unserved_mw = eh_results["Q_residual_MW"]
+    # -----------------------------
+    # 3.6 ECONOMIC MODEL
+    # -----------------------------
 
-    summary = {
-        "time_steps": time_steps,
-        "E_demand_MWh": sum(q_demand_mw),
-        "E_upstream_MWh": sum(q_upstream_mw),
-        "E_EH_MWh": sum(eh_results["Q_EH_MW"]),
-        "E_unserved_MWh": sum(q_unserved_mw),
-        "total_grid_cost_EUR": eh_results["total_cost_EUR"],
-    }
+    # CAPEX (€/MW)
+    # 投资成本（可根据文献调整）
+    CAPEX = (
+        ST * 300_000 +   # Solar thermal
+        TES * 30_000 +   # Thermal storage
+        HP * 800_000 +   # Heat pump
+        EH * 50_000      # Electric heater
+    )
 
-    return summary, eh_results
+    # OPEX
+    # 运行成本（电费）
+    electricity_cost = results["total_cost_EUR"]
+    OPEX = electricity_cost
+
+    # Total cost
+    # 总成本
+    total_cost = CAPEX + OPEX
+
+    return total_cost
 
 
+# =========================================================
+# 4. OPTIMIZATION (MULTI-START)
+# =========================================================
+def run_optimization(time_steps=8760, n_starts=8):
+    """
+    Multi-start optimization
+    多起点优化（避免局部最优）
+
+    n_starts: number of random initial points
+    """
+
+    ehg = load_heater_grid_module()
+
+    best_cost = 1e20
+    best_design = None
+
+    # Bounds (important!)
+    # 变量范围（必须）
+    bounds = [
+        (0, 50),   # ST
+        (0, 100),  # TES
+        (0, 20),   # HP
+        (0, 20)    # EH
+    ]
+
+    for i in range(n_starts):
+
+        print(f"\n--- Optimization run {i+1}/{n_starts} ---")
+
+        # Random initial guess
+        # 随机初始值
+        x0 = np.random.uniform(
+            [0, 0, 0, 0],
+            [50, 100, 20, 20]
+        )
+
+        # Objective wrapper
+        # 目标函数包装
+        def objective(x):
+            design = {
+                "ST": x[0],
+                "TES": x[1],
+                "HP": x[2],
+                "EH": x[3]
+            }
+            return evaluate_system(design, ehg, time_steps)
+
+        # Run optimizer
+        # 执行优化
+        result = minimize(
+            objective,
+            x0,
+            bounds=bounds,
+            method="L-BFGS-B"
+        )
+
+        print("Cost:", result.fun)
+
+        # Track best result
+        # 记录最优解
+        if result.fun < best_cost:
+            best_cost = result.fun
+            best_design = result.x
+
+    return best_design, best_cost
+
+
+# =========================================================
+# 5. MAIN ENTRYPOINT
+# =========================================================
 if __name__ == "__main__":
-    summary, _ = run_main_simulation(8760)
 
-    print("=== Python Main Simulation Summary ===")
-    print(f"Time steps: {summary['time_steps']}")
-    print(f"Total demand (MWh): {summary['E_demand_MWh']:.1f}")
-    print(f"Upstream covered (MWh): {summary['E_upstream_MWh']:.1f}")
-    print(f"Electric heater covered (MWh): {summary['E_EH_MWh']:.1f}")
-    print(f"Unserved residual (MWh): {summary['E_unserved_MWh']:.1f}")
-    print(f"Total grid cost (EUR): {summary['total_grid_cost_EUR']:.2f}")
+    best_design, best_cost = run_optimization(
+        time_steps=8760,
+        n_starts=8
+    )
+
+    print("\n====== FINAL OPTIMAL RESULT ======")
+
+    print(f"Optimal ST (MW):  {best_design[0]:.2f}")
+    print(f"Optimal TES (MWh): {best_design[1]:.2f}")
+    print(f"Optimal HP (MW):  {best_design[2]:.2f}")
+    print(f"Optimal EH (MW):  {best_design[3]:.2f}")
+
+    print(f"\nMinimum total cost (EUR): {best_cost:.2f}")
