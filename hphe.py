@@ -2,7 +2,7 @@ import numpy as np
 
 def simulate_heat_pump_engine(
     Q_ST_hourly: np.ndarray,
-    Q_demand_hourly: 10e6,
+    Q_demand_hourly: np.full(8760, 10e6),
     T_cold_HP: float = 70.0,
     T_hot_HP: float = 157.0,
     T_cold_HE: float = 40.0,
