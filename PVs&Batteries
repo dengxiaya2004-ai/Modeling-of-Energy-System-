@@ -1,0 +1,1075 @@
+"""
+================================================================================
+MJ2438 – Modeling of Energy Systems
+Techno-Economic Assessment: PV + Li-ion Battery + Inverter Subsystem
+Location : Seville, Spain  (37.4°N, 5.9°W)
+Plant     : 10 MW industrial process-heat plant, 08:00–18:00
+Coverage  : PV + Battery covers 40 % of total demand
+================================================================================
+
+Component Datasheets used
+──────────────────────────
+PV Panel  : Jinko Solar Tiger Neo 72HL4-BDV 590 Wp (ENF #55991)
+            N-type TOPCon bifacial, η = 22.65 %, γ = –0.29 %/°C
+Inverter  : Sungrow 1+X Modular (SG1100UD-20), 1.1 MW/module, η > 99 %
+Battery   : Tesla Megapack 2 XL – 4-hour config
+            979 kW / 3 916 kWh per unit, RTE = 93.7 %  (Datasheet Rev.1.5.1, 2023)
+
+Usage
+──────────────────────────
+  1. Set TMY_FILE (line ~42) to your PVGIS CSV filename, then:
+       python pv_battery_subsystem.py
+
+  2. Or override the file at runtime:
+       python pv_battery_subsystem.py --pvgis path/to/tmy.csv
+
+For real weather data download the Seville TMY CSV from:
+  https://re.jrc.ec.europa.eu/pvg_tools/en/#TMY
+  (Seville: lat=37.39, lon=-5.99, select "TMY", download CSV)
+================================================================================
+"""
+
+import argparse
+import sys
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from dataclasses import dataclass, field
+from typing import Optional, Tuple
+
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ★  SET YOUR TMY FILE PATH HERE  ★
+# Put the filename (or full path) of your PVGIS CSV download below.
+# The file should be in the same folder as this script, or give the full path.
+# Example:  TMY_FILE = "tmy_37.390_-5.990_2005_2020.csv"
+# ──────────────────────────────────────────────────────────────────────────────
+TMY_FILE = "Sevilla_TMY.csv"   # ← change this to your actual filename
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 1.  COMPONENT SPECIFICATION DATACLASSES
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class JinkoTigerNeo:
+    """
+    Jinko Solar Tiger Neo 72HL4-BDV  (ENF Crystalline Panel #55991)
+    Bifacial N-type TOPCon, dual glass, 182 mm M10 cells
+    Datasheet: JKM575-600N-72HL4-BDV
+    """
+    model: str          = "JKM590N-72HL4-BDV"
+    pmax_stc: float     = 590.0     # W  – STC peak power (mid-range 575-600 W)
+    vmp_stc: float      = 44.1      # V  – voltage at max power
+    imp_stc: float      = 13.38     # A  – current at max power
+    voc_stc: float      = 52.80     # V  – open-circuit voltage
+    isc_stc: float      = 14.20     # A  – short-circuit current
+    eta_stc: float      = 0.2265    # –  – module efficiency 22.65 %
+    gamma_pmax: float   = -0.0029   # /°C – temperature coeff of Pmax (–0.29 %/°C)
+    noct: float         = 45.0      # °C – nominal operating cell temperature
+    width_m: float      = 1.134     # m
+    length_m: float     = 2.278     # m
+    deg_y1: float       = 0.010     # fraction – first-year degradation < 1 %
+    deg_annual: float   = 0.004     # fraction – annual degradation 0.4 %/yr (years 2+)
+    warranty_product: int = 12      # years
+    warranty_power: int   = 30      # years
+    cost_eur_per_wp: float = 0.25   # €/Wp  (indicative utility-scale 2023)
+    bifaciality: float  = 0.70      # rear-side gain factor (not used in base case)
+
+    @property
+    def area_m2(self) -> float:
+        return self.width_m * self.length_m  # 2.579 m²
+
+
+@dataclass
+class SungrowModular:
+    """
+    Sungrow 1+X Modular Inverter  (SG1100UD-20)
+    Each module: 1 100 kW,  up to 8 modules in parallel = 8.8 MW block
+    Max efficiency > 99 %
+    """
+    model: str              = "SG1100UD-20"
+    power_module_kw: float  = 1_100.0   # kW per module
+    eta_max: float          = 0.990     # peak efficiency
+    eta_euro: float         = 0.988     # Euro weighted efficiency
+    max_modules: int        = 8         # hard limit from datasheet
+    cost_eur_per_kw: float  = 45.0      # €/kW  (utility scale)
+    lifetime_yr: int        = 25        # years
+
+    def modules_needed(self, target_kw: float) -> int:
+        n = int(np.ceil(target_kw / self.power_module_kw))
+        return min(n, self.max_modules)
+
+    def rated_power_kw(self, target_kw: float) -> float:
+        return self.modules_needed(target_kw) * self.power_module_kw
+
+
+@dataclass
+class TeslaMegapack2XL:
+    """
+    Tesla Megapack 2 XL – 4-hour configuration
+    Datasheet Rev. 1.5.1 – February 10, 2023
+    Source: portal.ct.gov (PE1607 Supplement Attachment A)
+    """
+    model: str              = "Megapack 2 XL (4h)"
+    energy_kwh: float       = 3_916.0   # kWh AC energy per unit
+    power_kw: float         = 979.0     # kW  AC power per unit
+    rte: float              = 0.937     # round-trip efficiency 93.7 %
+    voltage_v: float        = 480.0     # V AC nominal (3-phase)
+    min_soc: float          = 0.05      # 5 %  – minimum state of charge
+    max_soc: float          = 0.95      # 95 % – maximum state of charge
+    self_discharge_hr: float = 0.00005  # fraction per hour (LFP ≈ 0.005 %/h)
+    warranty_yr: int        = 15        # standard warranty (extendable to 20)
+    cost_eur_per_kwh: float = 280.0     # €/kWh  (indicative 2023)
+    cost_eur_per_kw: float  = 0.0       # included in per-kWh figure for BESS
+    cycles_lifetime: int    = 3_000     # approximate cycle life
+
+    @property
+    def charge_eta(self) -> float:
+        return np.sqrt(self.rte)
+
+    @property
+    def discharge_eta(self) -> float:
+        return np.sqrt(self.rte)
+
+    def units_for_energy(self, kwh: float) -> int:
+        usable = self.energy_kwh * (self.max_soc - self.min_soc)
+        return int(np.ceil(kwh / usable))
+
+    def units_for_power(self, kw: float) -> int:
+        return int(np.ceil(kw / self.power_kw))
+
+    def units_needed(self, kwh: float, kw: float) -> int:
+        return max(self.units_for_energy(kwh), self.units_for_power(kw))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2.  PV ARRAY MODEL
+# ──────────────────────────────────────────────────────────────────────────────
+
+class PVArray:
+    """
+    Simplified PV array model using the irradiance–temperature correction approach.
+    Suitable for yield estimation in early-stage techno-economic assessment.
+    For a higher-fidelity model, consider pvlib with the CEC single-diode model.
+    """
+
+    def __init__(self, panel: JinkoTigerNeo, n_panels: int,
+                 tilt_deg: float = 30.0,
+                 system_losses: float = 0.14):
+        """
+        Parameters
+        ----------
+        panel        : JinkoTigerNeo dataclass
+        n_panels     : number of panels installed
+        tilt_deg     : array tilt angle from horizontal [°] (30° typical for Seville)
+        system_losses: combined losses – soiling, wiring, mismatch, availability [–]
+        """
+        self.panel        = panel
+        self.n_panels     = n_panels
+        self.tilt         = tilt_deg
+        self.sys_losses   = system_losses
+        self.peak_kw      = panel.pmax_stc * n_panels / 1_000
+        self.area_m2      = panel.area_m2 * n_panels
+
+    # ------------------------------------------------------------------
+    def cell_temperature(self, ghi: np.ndarray, t_amb: np.ndarray) -> np.ndarray:
+        """NOCT thermal model:  Tcell = Tamb + (NOCT – 20) * G / 800"""
+        return t_amb + (self.panel.noct - 20.0) * ghi / 800.0
+
+    # ------------------------------------------------------------------
+    def dc_power_kw(self, ghi: np.ndarray, t_amb: np.ndarray,
+                    year: int = 1) -> np.ndarray:
+        """
+        DC output power array [kW] accounting for:
+          • irradiance ratio vs STC (1 000 W/m²)
+          • temperature correction
+          • annual degradation
+          • balance-of-system losses
+        """
+        t_cell     = self.cell_temperature(ghi, t_amb)
+        dT         = t_cell - 25.0                         # ΔT from STC
+        temp_corr  = 1.0 + self.panel.gamma_pmax * dT
+        irr_ratio  = np.clip(ghi / 1_000.0, 0.0, None)
+
+        # Degradation factor
+        if year == 1:
+            deg = 1.0 - self.panel.deg_y1
+        else:
+            deg = (1.0 - self.panel.deg_y1) * (1.0 - self.panel.deg_annual) ** (year - 1)
+
+        p_dc = self.peak_kw * irr_ratio * temp_corr * deg * (1.0 - self.sys_losses)
+        return np.maximum(p_dc, 0.0)
+
+    # ------------------------------------------------------------------
+    def annual_summary(self) -> dict:
+        return {
+            "n_panels"      : self.n_panels,
+            "peak_kWp"      : round(self.peak_kw, 2),
+            "area_m2"       : round(self.area_m2, 1),
+            "system_losses" : self.sys_losses,
+            "tilt_deg"      : self.tilt,
+        }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3.  BATTERY ENERGY STORAGE SYSTEM
+# ──────────────────────────────────────────────────────────────────────────────
+
+class BatteryESS:
+    """
+    Rule-based operational model for the Tesla Megapack 2 XL battery system.
+    One-hour time resolution.
+
+    Dispatch priority (charging)  : PV surplus → battery
+    Dispatch priority (discharging): battery → unmet demand
+    """
+
+    def __init__(self, spec: TeslaMegapack2XL, n_units: int):
+        self.spec     = spec
+        self.n_units  = n_units
+
+        self.capacity_kwh = spec.energy_kwh * n_units
+        self.max_p_kw     = spec.power_kw   * n_units
+        self.eta_ch       = spec.charge_eta
+        self.eta_dis      = spec.discharge_eta
+
+        self.min_e = self.capacity_kwh * spec.min_soc
+        self.max_e = self.capacity_kwh * spec.max_soc
+
+        # Ramp limit: 20 % of max power per hour (conservative)
+        self.ramp_limit_kw = self.max_p_kw * 0.20
+
+        self._soc_kwh  = self.capacity_kwh * 0.50   # start at 50 %
+        self._prev_p   = 0.0                          # previous dispatch
+
+    # ------------------------------------------------------------------
+    @property
+    def soc_kwh(self) -> float:
+        return self._soc_kwh
+
+    @property
+    def soc_pct(self) -> float:
+        return self._soc_kwh / self.capacity_kwh * 100.0
+
+    # ------------------------------------------------------------------
+    def reset(self, initial_soc: float = 0.50):
+        self._soc_kwh = self.capacity_kwh * initial_soc
+        self._prev_p  = 0.0
+
+    # ------------------------------------------------------------------
+    def step(self, net_demand_kw: float, dt: float = 1.0) -> dict:
+        """
+        Simulate one time-step.
+
+        Parameters
+        ----------
+        net_demand_kw : positive = need to discharge; negative = surplus (charge)
+        dt            : time-step length [h], default 1 h
+
+        Returns
+        -------
+        dict with keys: p_charge, p_discharge, soc_kwh, soc_pct
+        """
+        p_charge = p_discharge = 0.0
+
+        if net_demand_kw < 0:
+            # ── Charging ────────────────────────────────────────────────
+            surplus = -net_demand_kw
+            p_req   = min(surplus, self.max_p_kw)
+
+            # Ramp constraint
+            p_req = min(p_req, self._prev_p + self.ramp_limit_kw)
+
+            # Energy headroom in battery
+            headroom_kw = (self.max_e - self._soc_kwh) / (self.eta_ch * dt)
+            p_charge    = min(p_req, max(headroom_kw, 0.0))
+
+            self._soc_kwh += p_charge * self.eta_ch * dt
+
+        elif net_demand_kw > 0:
+            # ── Discharging ─────────────────────────────────────────────
+            p_req = min(net_demand_kw, self.max_p_kw)
+
+            # Ramp constraint
+            p_req = min(p_req, self._prev_p + self.ramp_limit_kw)
+
+            # Available energy
+            available_kw = (self._soc_kwh - self.min_e) * self.eta_dis / dt
+            p_discharge  = min(p_req, max(available_kw, 0.0))
+
+            self._soc_kwh -= p_discharge / self.eta_dis * dt
+
+        # Self-discharge
+        self._soc_kwh *= (1.0 - self.spec.self_discharge_hr * dt)
+        self._soc_kwh  = float(np.clip(self._soc_kwh, self.min_e, self.max_e))
+
+        self._prev_p = p_charge if p_charge > 0 else p_discharge
+
+        return {
+            "p_charge_kw"    : p_charge,
+            "p_discharge_kw" : p_discharge,
+            "soc_kwh"        : self._soc_kwh,
+            "soc_pct"        : self.soc_pct,
+        }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4.  INVERTER MODEL
+# ──────────────────────────────────────────────────────────────────────────────
+
+class Inverter:
+    """
+    Sungrow 1+X modular inverter efficiency model.
+    Efficiency is approximated as a function of loading ratio.
+    """
+
+    def __init__(self, spec: SungrowModular, n_modules: int):
+        self.spec      = spec
+        self.n_modules = n_modules
+        self.rated_kw  = spec.power_module_kw * n_modules
+
+    # ------------------------------------------------------------------
+    def ac_power_kw(self, dc_kw: np.ndarray) -> np.ndarray:
+        """
+        Convert DC → AC through the inverter efficiency curve.
+        Three-segment model based on typical central-inverter curves:
+          • < 5 % load  : below cut-in, output = 0
+          • 5 – 20 % load: ramp from 0.960 to η_euro
+          • > 20 % load : η = η_euro (≈ 98.8 %)
+        """
+        ratio = np.clip(dc_kw / self.rated_kw, 0.0, 1.10)
+        eta   = np.where(
+            ratio < 0.05,
+            0.0,
+            np.where(
+                ratio < 0.20,
+                0.960 + (self.spec.eta_euro - 0.960) * (ratio - 0.05) / 0.15,
+                self.spec.eta_euro,
+            ),
+        )
+        return np.maximum(dc_kw * eta, 0.0)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 5.  RULE-BASED DISPATCHER
+# ──────────────────────────────────────────────────────────────────────────────
+
+class Dispatcher:
+    """
+    Hourly rule-based energy management system.
+
+    Dispatch logic
+    ──────────────
+    Operating hours (08:00–17:59):
+      1. PV AC output → directly to load (up to demand)
+      2. PV surplus   → charge battery
+      3. Remaining demand → discharge battery
+      4. Any remaining gap → flagged as 'unmet' (covered by other subsystems)
+
+    Non-operating hours:
+      1. PV surplus → charge battery (no load)
+      2. PV excess beyond battery capacity → curtailed
+    """
+
+    def __init__(self, pv: PVArray, battery: BatteryESS, inverter: Inverter,
+                 coverage_frac: float = 0.40):
+        self.pv            = pv
+        self.battery       = battery
+        self.inverter      = inverter
+        self.coverage_frac = coverage_frac
+
+    # ------------------------------------------------------------------
+    def run(self, ghi: np.ndarray, t_amb: np.ndarray,
+            total_demand_kw: np.ndarray, operating_hours: np.ndarray,
+            year: int = 1) -> pd.DataFrame:
+        """
+        Simulate one full year (8 760 hourly time-steps).
+
+        Parameters
+        ----------
+        ghi             : Global Horizontal Irradiance  [W/m²]  (8760,)
+        t_amb           : Ambient temperature           [°C]    (8760,)
+        total_demand_kw : Total plant heat demand       [kW]    (8760,)
+        operating_hours : Boolean mask, True = plant on        (8760,)
+        year            : Operational year (affects degradation)
+
+        Returns
+        -------
+        pd.DataFrame with hourly energy flows and KPIs
+        """
+        n   = len(ghi)
+        pv_dc  = self.pv.dc_power_kw(ghi, t_amb, year)
+        pv_ac  = self.inverter.ac_power_kw(pv_dc)
+        target = total_demand_kw * self.coverage_frac
+
+        cols = ["pv_dc_kw", "pv_ac_kw", "target_kw",
+                "pv_to_load_kw", "bat_to_load_kw",
+                "p_charge_kw", "p_discharge_kw",
+                "unmet_kw", "curtailed_kw",
+                "soc_kwh", "soc_pct"]
+        data = {c: np.zeros(n) for c in cols}
+        data["pv_dc_kw"][:] = pv_dc
+        data["pv_ac_kw"][:] = pv_ac
+        data["target_kw"][:] = target
+
+        self.battery.reset(initial_soc=0.50)
+
+        for t in range(n):
+            pv = pv_ac[t]
+            dm = target[t]
+            op = operating_hours[t]
+
+            if not op:
+                # Off hours: charge battery with any available PV
+                if pv > 0:
+                    b = self.battery.step(-pv, dt=1.0)
+                    data["p_charge_kw"][t]  = b["p_charge_kw"]
+                    data["curtailed_kw"][t] = max(pv - b["p_charge_kw"], 0.0)
+                else:
+                    b = self.battery.step(0.0, dt=1.0)
+                data["soc_kwh"][t] = b["soc_kwh"]
+                data["soc_pct"][t] = b["soc_pct"]
+                continue
+
+            # Step 1 – PV directly to load
+            pv2load = min(pv, dm)
+            surplus  = pv - pv2load
+            remain   = dm - pv2load
+            data["pv_to_load_kw"][t] = pv2load
+
+            # Step 2 – surplus PV charges battery
+            if surplus > 0:
+                b = self.battery.step(-surplus, dt=1.0)
+                data["p_charge_kw"][t]  = b["p_charge_kw"]
+                data["curtailed_kw"][t] = max(surplus - b["p_charge_kw"], 0.0)
+                soc_kwh = b["soc_kwh"]
+                soc_pct = b["soc_pct"]
+            else:
+                soc_kwh = self.battery.soc_kwh
+                soc_pct = self.battery.soc_pct
+
+            # Step 3 – discharge battery to meet remaining demand
+            if remain > 0:
+                b = self.battery.step(remain, dt=1.0)
+                data["p_discharge_kw"][t] = b["p_discharge_kw"]
+                data["bat_to_load_kw"][t] = b["p_discharge_kw"]
+                data["unmet_kw"][t]       = max(remain - b["p_discharge_kw"], 0.0)
+                soc_kwh = b["soc_kwh"]
+                soc_pct = b["soc_pct"]
+
+            data["soc_kwh"][t] = soc_kwh
+            data["soc_pct"][t] = soc_pct
+
+        df = pd.DataFrame(data)
+        df["delivered_kw"]    = df["pv_to_load_kw"] + df["bat_to_load_kw"]
+        df["actual_cov_pct"]  = np.where(
+            df["target_kw"] > 0,
+            df["delivered_kw"] / df["target_kw"] * 100.0, 0.0)
+        df["hour_of_day"]     = np.arange(n) % 24
+        df["day_of_year"]     = np.arange(n) // 24 + 1
+        df["ghi_wm2"]         = ghi
+        df["t_amb_c"]         = t_amb
+        df["total_demand_kw"] = total_demand_kw
+        df["operating"]       = operating_hours
+        return df
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 6.  ECONOMIC MODEL
+# ──────────────────────────────────────────────────────────────────────────────
+
+class EconomicModel:
+    """
+    Levelised Cost of Electricity (LCOE) model for the PV + Battery subsystem.
+
+    LCOE  [€/MWh] = (CAPEX + NPV_OPEX) / Σ_t  E_t / (1+r)^t
+
+    Follows the same structure as Assignment 4 (LCoH) but adapted for
+    an electricity-generating subsystem.
+    """
+
+    def __init__(self,
+                 pv      : PVArray,
+                 battery : BatteryESS,
+                 inverter: Inverter,
+                 panel_spec   : JinkoTigerNeo,
+                 battery_spec : TeslaMegapack2XL,
+                 inverter_spec: SungrowModular,
+                 lifetime_yr     : int   = 25,
+                 discount_rate   : float = 0.05,
+                 land_eur_m2     : float = 10.0,
+                 packing_factor  : float = 0.40,   # GCR for ground-mount array
+                 bos_pct         : float = 0.12,   # BOS as % of hardware cost
+                 epc_pct         : float = 0.08,   # EPC as % of subtotal
+                 om_pv_pct       : float = 0.015,  # O&M as % of PV CAPEX/yr
+                 om_bat_pct      : float = 0.020,  # O&M as % of battery CAPEX/yr
+                 om_inv_pct      : float = 0.010,  # O&M as % of inverter CAPEX/yr
+                 insurance_pct   : float = 0.005): # Insurance % of total CAPEX/yr
+        self.pv           = pv
+        self.battery      = battery
+        self.inverter     = inverter
+        self.p_spec       = panel_spec
+        self.b_spec       = battery_spec
+        self.i_spec       = inverter_spec
+        self.lifetime     = lifetime_yr
+        self.r            = discount_rate
+        self.land_eur_m2  = land_eur_m2
+        self.gcr          = packing_factor
+        self.bos_pct      = bos_pct
+        self.epc_pct      = epc_pct
+        self.om_pv_pct    = om_pv_pct
+        self.om_bat_pct   = om_bat_pct
+        self.om_inv_pct   = om_inv_pct
+        self.ins_pct      = insurance_pct
+
+    # ------------------------------------------------------------------
+    def capex(self) -> dict:
+        """Return CAPEX breakdown in €."""
+        pv_hw  = self.pv.peak_kw  * 1_000 * self.p_spec.cost_eur_per_wp
+        bat_hw = self.battery.capacity_kwh * self.b_spec.cost_eur_per_kwh
+        inv_hw = self.inverter.rated_kw * self.i_spec.cost_eur_per_kw
+        bos    = (pv_hw + inv_hw) * self.bos_pct
+        land   = (self.pv.area_m2 / self.gcr) * self.land_eur_m2
+        epc    = (pv_hw + bat_hw + inv_hw + bos) * self.epc_pct
+        total  = pv_hw + bat_hw + inv_hw + bos + land + epc
+        return {
+            "PV panels (Jinko Tiger Neo)"   : pv_hw,
+            "Battery (Tesla Megapack 2 XL)" : bat_hw,
+            "Inverter (Sungrow 1+X)"        : inv_hw,
+            "Balance of System (BOS)"       : bos,
+            "Land"                           : land,
+            "EPC"                            : epc,
+            "Total CAPEX"                    : total,
+        }
+
+    # ------------------------------------------------------------------
+    def opex_annual(self) -> dict:
+        """Return annual OPEX breakdown in €/yr."""
+        cap = self.capex()
+        pv_om  = cap["PV panels (Jinko Tiger Neo)"]   * self.om_pv_pct
+        bat_om = cap["Battery (Tesla Megapack 2 XL)"] * self.om_bat_pct
+        inv_om = cap["Inverter (Sungrow 1+X)"]        * self.om_inv_pct
+        ins    = cap["Total CAPEX"]                    * self.ins_pct
+        total  = pv_om + bat_om + inv_om + ins
+        return {
+            "PV O&M"      : pv_om,
+            "Battery O&M" : bat_om,
+            "Inverter O&M": inv_om,
+            "Insurance"   : ins,
+            "Total OPEX"  : total,
+        }
+
+    # ------------------------------------------------------------------
+    def _annuity_factor(self) -> float:
+        r, n = self.r, self.lifetime
+        return (1 - (1 + r) ** (-n)) / r
+
+    def npv_opex(self) -> float:
+        return self.opex_annual()["Total OPEX"] * self._annuity_factor()
+
+    # ------------------------------------------------------------------
+    def lcoe(self, annual_energy_kwh: float) -> float:
+        """
+        Levelised Cost of Electricity [€/MWh].
+        Uses discounted lifetime energy with annual PV degradation.
+        """
+        cap      = self.capex()["Total CAPEX"]
+        opex_npv = self.npv_opex()
+
+        total_disc_energy = 0.0
+        for y in range(1, self.lifetime + 1):
+            if y == 1:
+                ey = annual_energy_kwh
+            else:
+                ey = (annual_energy_kwh
+                      * (1 - self.p_spec.deg_y1)
+                      * (1 - self.p_spec.deg_annual) ** (y - 1))
+            total_disc_energy += ey / (1 + self.r) ** y
+
+        return (cap + opex_npv) / total_disc_energy * 1_000  # €/MWh
+
+    # ------------------------------------------------------------------
+    def full_summary(self, df: pd.DataFrame) -> dict:
+        """Compile complete techno-economic KPI dictionary from simulation results."""
+        annual_pv        = df["pv_ac_kw"].sum()          # kWh
+        annual_delivered = df["delivered_kw"].sum()       # kWh
+        annual_bat_dis   = df["bat_to_load_kw"].sum()     # kWh
+        annual_curtailed = df["curtailed_kw"].sum()        # kWh
+        annual_unmet     = df["unmet_kw"].sum()            # kWh
+        total_target     = df["target_kw"].sum()           # kWh
+
+        cap  = self.capex()
+        opex = self.opex_annual()
+        lcoe = self.lcoe(annual_delivered)
+
+        solar_share  = (annual_pv / total_target * 100) if total_target > 0 else 0.0
+        actual_cov   = (annual_delivered / total_target * 100) if total_target > 0 else 0.0
+        bat_share    = (annual_bat_dis / annual_delivered * 100) if annual_delivered > 0 else 0.0
+        curtail_rate = (annual_curtailed / annual_pv * 100) if annual_pv > 0 else 0.0
+
+        return {
+            "CAPEX"  : cap,
+            "Annual OPEX" : opex,
+            "KPIs" : {
+                "Annual PV generation [MWh]"    : annual_pv / 1_000,
+                "Annual energy delivered [MWh]" : annual_delivered / 1_000,
+                "Battery share of delivery [%]" : bat_share,
+                "Curtailed energy [MWh]"        : annual_curtailed / 1_000,
+                "Unmet demand [MWh]"            : annual_unmet / 1_000,
+                "Solar share [%]"               : solar_share,
+                "Actual coverage [%]"           : actual_cov,
+                "LCOE [€/MWh]"                  : lcoe,
+                "Specific CAPEX [€/kWp]"        : cap["Total CAPEX"] / self.pv.peak_kw,
+                "CAPEX per MWh stored [€/MWh]"  : cap["Battery (Tesla Megapack 2 XL)"]
+                                                   / (self.battery.capacity_kwh / 1_000),
+            },
+        }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 7.  WEATHER DATA HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
+
+def generate_synthetic_tmy(lat: float = 37.4, lon: float = -5.9,
+                            seed: int = 42) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Generate a synthetic Typical Meteorological Year for Seville, Spain.
+    Annual GHI ≈ 1 850 kWh/m²  |  Mean temperature ≈ 18.5 °C
+
+    NOTE: This is a simplified model for development/testing purposes.
+    For the final project report, always use real PVGIS TMY data.
+    Download from: https://re.jrc.ec.europa.eu/pvg_tools/en/#TMY
+    (Seville: lat = 37.39, lon = –5.99)
+    """
+    rng = np.random.default_rng(seed)
+    t   = np.arange(8_760)
+    hod = t % 24           # hour of day
+    doy = t // 24 + 1      # day of year  (1–365)
+
+    # Solar geometry (simplified, no equation of time)
+    decl_rad = np.radians(23.45 * np.sin(np.radians(360 / 365 * (doy - 81))))
+    ha_rad   = np.radians((hod - 12.0) * 15.0)
+    lat_r    = np.radians(lat)
+    elev     = np.degrees(np.arcsin(
+        np.sin(lat_r) * np.sin(decl_rad)
+        + np.cos(lat_r) * np.cos(decl_rad) * np.cos(ha_rad)))
+
+    # Clear-sky GHI
+    ghi_cs = np.where(elev > 0.0, 1_000.0 * np.sin(np.radians(elev)), 0.0)
+
+    # Seasonal cloud cover (Seville: mostly clear, rainier in winter)
+    cloud_seasonal = 0.78 + 0.14 * np.sin(np.radians(360 / 365 * (doy - 180)))
+    cloud_noise    = np.clip(rng.normal(1.0, 0.12, 8_760), 0.25, 1.0)
+    ghi = np.maximum(ghi_cs * cloud_seasonal * cloud_noise, 0.0)
+
+    # Temperature (Seville: mean 18.5 °C, σ seasonal ≈ 9 °C)
+    t_seasonal = 18.5 + 9.0 * np.sin(np.radians(360 / 365 * (doy - 75)))
+    t_daily    = 4.0 * np.sin(np.radians(360 / 24 * (hod - 5)))
+    t_amb      = t_seasonal + t_daily + rng.normal(0.0, 1.2, 8_760)
+
+    return ghi, t_amb
+
+
+def load_pvgis_tmy(csv_path: str) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Load a real TMY from a PVGIS CSV export file.
+
+    PVGIS files have a variable-length text header before the data block.
+    This function finds the header row automatically by scanning for the
+    line that contains 'G(h)' (the GHI column label), so it works regardless
+    of whether PVGIS prepended 16, 17, or a different number of header lines.
+
+    Expected data columns (PVGIS TMY standard output):
+      'G(h)'  – Global Horizontal Irradiance  [W/m²]
+      'T2m'   – Ambient temperature at 2 m    [°C]
+    """
+    # Find the row index of the column-header line
+    header_row = None
+    with open(csv_path, "r", encoding="utf-8", errors="replace") as fh:
+        for idx, line in enumerate(fh):
+            if "G(h)" in line:
+                header_row = idx
+                break
+
+    if header_row is None:
+        raise ValueError(
+            f"Could not find 'G(h)' column in '{csv_path}'.\n"
+            "Make sure this is a PVGIS TMY CSV file.\n"
+            "Download from: https://re.jrc.ec.europa.eu/pvg_tools/en/#TMY"
+        )
+
+    df = pd.read_csv(csv_path, skiprows=header_row, nrows=8_760)
+
+    # Normalise column names (strip whitespace)
+    df.columns = df.columns.str.strip()
+
+    if "G(h)" not in df.columns or "T2m" not in df.columns:
+        raise ValueError(
+            f"Expected columns 'G(h)' and 'T2m' not found.\n"
+            f"Columns present: {list(df.columns)}"
+        )
+
+    ghi  = df["G(h)"].to_numpy(dtype=float)
+    tamb = df["T2m"].to_numpy(dtype=float)
+    return ghi, tamb
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 8.  SENSITIVITY ANALYSIS
+# ──────────────────────────────────────────────────────────────────────────────
+
+def sensitivity_analysis(base_pv_mwp: float,
+                          base_bat_mwh: float,
+                          panel_spec: JinkoTigerNeo,
+                          battery_spec: TeslaMegapack2XL,
+                          inverter_spec: SungrowModular,
+                          base_annual_energy_kwh: float,
+                          n_pv: int = 9,
+                          n_bat: int = 9) -> Tuple[np.ndarray, np.ndarray,
+                                                    np.ndarray, np.ndarray]:
+    """
+    2-D sensitivity of LCOE and CAPEX over a grid of PV size × battery size.
+    Energy is scaled proportionally from the base-case simulation result.
+
+    Returns
+    -------
+    pv_grid, bat_grid : 1-D arrays of PV [MWp] and battery [MWh] values
+    lcoe_mat, capex_mat : 2-D matrices (bat × pv) in €/MWh and M€
+    """
+    pv_vals  = np.linspace(base_pv_mwp  * 0.50, base_pv_mwp  * 1.70, n_pv)
+    bat_vals = np.linspace(base_bat_mwh * 0.40, base_bat_mwh * 1.80, n_bat)
+
+    lcoe_mat  = np.zeros((n_bat, n_pv))
+    capex_mat = np.zeros((n_bat, n_pv))
+
+    for j, pv_mwp in enumerate(pv_vals):
+        for i, bat_mwh in enumerate(bat_vals):
+            n_pan = int(np.ceil(pv_mwp * 1e6 / panel_spec.pmax_stc))
+            n_bat_u = battery_spec.units_for_energy(bat_mwh * 1_000)
+            n_inv   = inverter_spec.modules_needed(pv_mwp * 1_000)
+
+            pv_tmp  = PVArray(panel_spec, n_pan)
+            bat_tmp = BatteryESS(battery_spec, n_bat_u)
+            inv_tmp = Inverter(inverter_spec, n_inv)
+
+            econ    = EconomicModel(pv_tmp, bat_tmp, inv_tmp,
+                                    panel_spec, battery_spec, inverter_spec)
+
+            # Scale energy by PV ratio (simplified)
+            scale   = pv_mwp / base_pv_mwp
+            e_kwh   = base_annual_energy_kwh * np.clip(scale, 0.3, 2.0)
+
+            capex_mat[i, j] = econ.capex()["Total CAPEX"] / 1e6   # M€
+            lcoe_mat[i, j]  = econ.lcoe(e_kwh)                    # €/MWh
+
+    return pv_vals, bat_vals, lcoe_mat, capex_mat
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 9.  PLOTTING
+# ──────────────────────────────────────────────────────────────────────────────
+
+def plot_system_results(df: pd.DataFrame, summary: dict,
+                        pv_peak_mwp: float, bat_mwh: float,
+                        n_bat_units: int):
+    """Six-panel diagnostic figure for the base-case simulation."""
+
+    fig = plt.figure(figsize=(18, 15))
+    fig.suptitle(
+        "PV + Li-ion Battery Subsystem — Seville, Spain\n"
+        f"Jinko Solar {pv_peak_mwp:.1f} MWp  |  "
+        f"Tesla Megapack 2 XL ×{n_bat_units} ({bat_mwh:.0f} MWh)  |  "
+        f"Sungrow 1+X Modular Inverter",
+        fontsize=13, fontweight="bold", y=0.98)
+
+    gs = gridspec.GridSpec(3, 2, figure=fig, hspace=0.40, wspace=0.35)
+
+    # ── Panel 1: characteristic summer week ──────────────────────────
+    ax1 = fig.add_subplot(gs[0, 0])
+    # Summer solstice week (day 172 = June 21 → hour index 4 104)
+    s = slice(4_104, 4_104 + 168)
+    h = np.arange(168)
+    ax1.fill_between(h, df["target_kw"].iloc[s] / 1_000,
+                     alpha=0.20, color="gray", label="PV+Bat target demand")
+    ax1.plot(h, df["pv_ac_kw"].iloc[s] / 1_000,
+             color="gold", lw=1.8, label="PV AC output")
+    ax1.plot(h, df["delivered_kw"].iloc[s] / 1_000,
+             color="limegreen", lw=1.8, label="Delivered to load")
+    ax1.plot(h, df["p_discharge_kw"].iloc[s] / 1_000,
+             color="dodgerblue", lw=1.2, ls="--", label="Battery discharge")
+    ax1.set_xlabel("Hour of week")
+    ax1.set_ylabel("Power [MW]")
+    ax1.set_title("Characteristic Summer Week (Week 25)")
+    ax1.legend(fontsize=7.5)
+    ax1.grid(True, alpha=0.3)
+
+    # ── Panel 2: SoC – same week ─────────────────────────────────────
+    ax2a = fig.add_subplot(gs[0, 1])
+    ax2b = ax2a.twinx()
+    ax2a.plot(h, df["soc_pct"].iloc[s],
+              color="purple", lw=1.8, label="SoC [%]")
+    ax2b.bar(h, df["p_charge_kw"].iloc[s] / 1_000,
+             color="orange", alpha=0.5, width=0.8, label="Charging [MW]")
+    ax2a.set_xlabel("Hour of week")
+    ax2a.set_ylabel("State of Charge [%]", color="purple")
+    ax2b.set_ylabel("Charging Power [MW]", color="darkorange")
+    ax2a.set_title("Battery State of Charge — Summer Week")
+    ax2a.legend(loc="upper left", fontsize=7.5)
+    ax2b.legend(loc="upper right", fontsize=7.5)
+    ax2a.grid(True, alpha=0.3)
+
+    # ── Panel 3: monthly energy balance ──────────────────────────────
+    ax3 = fig.add_subplot(gs[1, 0])
+    months = ["Jan","Feb","Mar","Apr","May","Jun",
+              "Jul","Aug","Sep","Oct","Nov","Dec"]
+    hours_per_month = [744,672,744,720,744,720,744,744,720,744,720,744]
+    cum = 0
+    m_pv, m_dem, m_del = [], [], []
+    for hpm in hours_per_month:
+        sl = slice(cum, cum + hpm)
+        m_pv.append(df["pv_ac_kw"].iloc[sl].sum() / 1_000)
+        m_dem.append(df["target_kw"].iloc[sl].sum() / 1_000)
+        m_del.append(df["delivered_kw"].iloc[sl].sum() / 1_000)
+        cum += hpm
+    x = np.arange(12)
+    ax3.bar(x - 0.22, m_pv, 0.40, color="gold",  alpha=0.85, label="PV generation")
+    ax3.bar(x + 0.22, m_dem, 0.40, color="gray",  alpha=0.45, label="Target demand")
+    ax3.plot(x, m_del, "go--", lw=1.5, ms=5, label="Delivered to load")
+    ax3.set_xticks(x); ax3.set_xticklabels(months, fontsize=8)
+    ax3.set_ylabel("Energy [MWh]")
+    ax3.set_title("Monthly Energy Balance")
+    ax3.legend(fontsize=7.5)
+    ax3.grid(True, alpha=0.3, axis="y")
+
+    # ── Panel 4: operating mode pie ───────────────────────────────────
+    ax4 = fig.add_subplot(gs[1, 1])
+    op = df[df["operating"]]
+    pv_only   = ((op["pv_to_load_kw"] > 1)   & (op["bat_to_load_kw"] < 1)).sum()
+    bat_only  = ((op["pv_to_load_kw"] < 1)   & (op["bat_to_load_kw"] > 1)).sum()
+    pv_bat    = ((op["pv_to_load_kw"] > 1)   & (op["bat_to_load_kw"] > 1)).sum()
+    unmet_h   = (op["unmet_kw"] > 1).sum()
+    idle_h    = max(len(op) - pv_only - bat_only - pv_bat - unmet_h, 0)
+    raw = [pv_only, bat_only, pv_bat, unmet_h, idle_h]
+    lbls = ["PV only", "Battery only", "PV + Battery",
+            "Unmet (grid backup)", "Idle"]
+    cols = ["gold", "dodgerblue", "limegreen", "tomato", "lightgray"]
+    nz = [(v, l, c) for v, l, c in zip(raw, lbls, cols) if v > 0]
+    if nz:
+        vz, lz, cz = zip(*nz)
+        ax4.pie(vz, labels=lz, colors=cz, autopct="%1.1f%%",
+                startangle=90, textprops={"fontsize": 8})
+    ax4.set_title("Operating Mode Distribution")
+
+    # ── Panel 5: CAPEX waterfall ──────────────────────────────────────
+    ax5 = fig.add_subplot(gs[2, 0])
+    cap_items = {k: v / 1e6 for k, v in summary["CAPEX"].items()
+                 if k != "Total CAPEX"}
+    bar_colors = ["gold", "dodgerblue", "steelblue", "gray", "tan", "salmon"]
+    bars = ax5.barh(list(cap_items.keys()),
+                    list(cap_items.values()),
+                    color=bar_colors[:len(cap_items)])
+    ax5.set_xlabel("Cost [M€]")
+    ax5.set_title(f"CAPEX Breakdown — Total: "
+                  f"{summary['CAPEX']['Total CAPEX']/1e6:.1f} M€")
+    ax5.bar_label(bars, fmt="%.1f M€", padding=3, fontsize=8)
+    ax5.grid(True, alpha=0.3, axis="x")
+
+    # ── Panel 6: GHI heatmap ─────────────────────────────────────────
+    ax6 = fig.add_subplot(gs[2, 1])
+    ghi_mat = df["ghi_wm2"].values.reshape(365, 24)
+    im = ax6.imshow(ghi_mat.T, aspect="auto", origin="lower",
+                    cmap="YlOrRd", vmin=0, vmax=1_000)
+    plt.colorbar(im, ax=ax6, label="GHI [W/m²]")
+    ax6.axhline(8, color="white", lw=1.2, ls="--", alpha=0.8)
+    ax6.axhline(18, color="white", lw=1.2, ls="--", alpha=0.8)
+    ax6.set_xlabel("Day of Year")
+    ax6.set_ylabel("Hour of Day")
+    ax6.set_title("Annual GHI Heatmap  (dashed = operating hours)")
+
+    plt.savefig("pv_battery_results.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print("\n  → Figure saved: pv_battery_results.png")
+
+
+def plot_sensitivity_results(pv_grid, bat_grid, lcoe_mat, capex_mat,
+                              base_pv, base_bat):
+    """Contour plots for the 2-D sensitivity analysis."""
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig.suptitle("Sensitivity Analysis: LCOE and CAPEX vs PV Size & Battery Capacity",
+                 fontsize=13, fontweight="bold")
+
+    data_pairs = [
+        (lcoe_mat,  "LCOE [€/MWh]",     "RdYlGn_r"),
+        (capex_mat, "Total CAPEX [M€]",  "Blues"),
+    ]
+    for ax, (mat, title, cmap) in zip(axes, data_pairs):
+        cf = ax.contourf(pv_grid, bat_grid, mat, 14, cmap=cmap)
+        cs = ax.contour(pv_grid, bat_grid, mat, 8,
+                        colors="k", linewidths=0.6)
+        ax.clabel(cs, inline=True, fontsize=7, fmt="%.0f")
+        plt.colorbar(cf, ax=ax)
+        ax.scatter([base_pv], [base_bat], marker="*", s=250,
+                   color="red", zorder=5, label="Base case")
+        ax.set_xlabel("PV Peak Power [MWp]")
+        ax.set_ylabel("Battery Capacity [MWh]")
+        ax.set_title(title)
+        ax.legend(fontsize=9)
+
+    plt.tight_layout()
+    plt.savefig("sensitivity_analysis.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    print("  → Figure saved: sensitivity_analysis.png")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 10.  MAIN
+# ──────────────────────────────────────────────────────────────────────────────
+
+def main(pvgis_path: Optional[str] = None):
+    SEP = "─" * 68
+
+    # ── Component specs ───────────────────────────────────────────────
+    panel_spec   = JinkoTigerNeo()
+    battery_spec = TeslaMegapack2XL()
+    inverter_spec = SungrowModular()
+
+    # ── System sizing ─────────────────────────────────────────────────
+    #
+    #  Total plant demand  : 10 MW  (08:00–18:00)
+    #  PV+Bat coverage     : 40 %   → 4 MW target
+    #  Storage duration    : 4 h    → 16 MWh battery
+    #  PV oversizing factor: 1.6×   (charge battery AND meet midday demand)
+    #    Reasoning: Seville PSH ≈ 5.5 h/day; need 4 MW × 10 h = 40 MWh/day
+    #    PV peak ≈ 40 MWh / (5.5 h × 0.86 losses) ≈ 8.5 MWp
+
+    TOTAL_MW      = 10.0
+    COVERAGE      = 0.40
+    TARGET_MW     = TOTAL_MW * COVERAGE       # 4 MW
+    STORAGE_HRS   = 4.0
+
+    PV_PEAK_MWP   = 8.5                       # MWp
+    BAT_ENERGY_KWH = TARGET_MW * 1_000 * STORAGE_HRS  # 16 000 kWh
+    BAT_POWER_KW   = TARGET_MW * 1_000                 # 4 000 kW
+
+    n_panels  = int(np.ceil(PV_PEAK_MWP * 1e6 / panel_spec.pmax_stc))
+    n_bat     = battery_spec.units_needed(BAT_ENERGY_KWH, BAT_POWER_KW)
+    n_inv     = inverter_spec.modules_needed(PV_PEAK_MWP * 1_000)
+
+    # Instantiate
+    pv_system  = PVArray(panel_spec, n_panels)
+    bat_system = BatteryESS(battery_spec, n_bat)
+    inv_system = Inverter(inverter_spec, n_inv)
+
+    # ── Print sizing ──────────────────────────────────────────────────
+    print(f"\n{SEP}")
+    print(f"  MJ2438 – PV + Battery Subsystem  |  Seville, Spain")
+    print(f"{SEP}")
+    print(f"\n  COMPONENT SIZING")
+    print(f"  {'PV Array':<20}: {n_panels:,} panels × {panel_spec.pmax_stc:.0f} W  "
+          f"= {pv_system.peak_kw/1000:.2f} MWp  "
+          f"({pv_system.area_m2/1000:.1f} km² collector area)")
+    print(f"  {'Battery':<20}: {n_bat} × Tesla Megapack 2 XL  "
+          f"= {n_bat * battery_spec.energy_kwh / 1000:.1f} MWh  "
+          f"| {n_bat * battery_spec.power_kw / 1000:.2f} MW  "
+          f"(RTE = {battery_spec.rte*100:.1f} %)")
+    print(f"  {'Inverter':<20}: {n_inv} × Sungrow 1.1 MW  "
+          f"= {n_inv * inverter_spec.power_module_kw / 1000:.1f} MW")
+
+    # ── Weather ───────────────────────────────────────────────────────
+    # Priority: CLI --pvgis flag  >  TMY_FILE constant  >  synthetic fallback
+    weather_file = pvgis_path or TMY_FILE
+    try:
+        ghi, t_amb = load_pvgis_tmy(weather_file)
+        print(f"\n  Weather: PVGIS TMY data loaded  ← {weather_file}")
+        print(f"  Annual GHI = {ghi.sum()/1000:.0f} kWh/m²  |  "
+              f"Mean T_amb = {t_amb.mean():.1f} °C")
+    except FileNotFoundError:
+        print(f"\n  ⚠  TMY file '{weather_file}' not found — falling back to synthetic TMY.")
+        print(f"  Set TMY_FILE at the top of the script to your PVGIS CSV filename.")
+        ghi, t_amb = generate_synthetic_tmy()
+        print(f"  Weather: Synthetic TMY (Seville, 37.4°N)  "
+              f"— annual GHI ≈ {ghi.sum()/1000:.0f} kWh/m²")
+
+    # ── Demand profile ────────────────────────────────────────────────
+    hours         = np.arange(8_760)
+    hour_of_day   = hours % 24
+    op_mask       = (hour_of_day >= 8) & (hour_of_day < 18)
+    demand_kw     = np.where(op_mask, TOTAL_MW * 1_000, 0.0)
+
+    # ── Dispatch simulation ───────────────────────────────────────────
+    dispatcher = Dispatcher(pv_system, bat_system, inv_system, COVERAGE)
+    df = dispatcher.run(ghi, t_amb, demand_kw, op_mask, year=1)
+    df["ghi_wm2"]       = ghi
+    df["t_amb_c"]       = t_amb
+    df["total_demand_kw"] = demand_kw
+
+    # ── Economic analysis ─────────────────────────────────────────────
+    econ    = EconomicModel(pv_system, bat_system, inv_system,
+                            panel_spec, battery_spec, inverter_spec)
+    summary = econ.full_summary(df)
+
+    # ── Print results ─────────────────────────────────────────────────
+    print(f"\n{SEP}")
+    print(f"  CAPEX BREAKDOWN")
+    print(f"{SEP}")
+    for k, v in summary["CAPEX"].items():
+        bar = "█" * int(v / summary["CAPEX"]["Total CAPEX"] * 30)
+        print(f"  {k:<38}: € {v:>12,.0f}  {bar}")
+
+    print(f"\n{SEP}")
+    print(f"  ANNUAL OPEX")
+    print(f"{SEP}")
+    for k, v in summary["Annual OPEX"].items():
+        print(f"  {k:<38}: € {v:>10,.0f} / yr")
+
+    print(f"\n{SEP}")
+    print(f"  KEY PERFORMANCE INDICATORS")
+    print(f"{SEP}")
+    for k, v in summary["KPIs"].items():
+        print(f"  {k:<45}: {v:>10.2f}")
+    print(f"\n{SEP}\n")
+
+    # ── Save CSV ──────────────────────────────────────────────────────
+    df.to_csv("hourly_results.csv", index=False)
+    print("  → Hourly results saved: hourly_results.csv")
+
+    # ── Plots ─────────────────────────────────────────────────────────
+    plot_system_results(df, summary,
+                        pv_peak_mwp=pv_system.peak_kw / 1_000,
+                        bat_mwh=bat_system.capacity_kwh / 1_000,
+                        n_bat_units=n_bat)
+
+    # ── Sensitivity analysis ──────────────────────────────────────────
+    print("  Running 2-D sensitivity analysis (LCOE & CAPEX)…")
+    annual_del = df["delivered_kw"].sum()   # kWh
+    pv_g, bat_g, lcoe_m, capex_m = sensitivity_analysis(
+        base_pv_mwp            = pv_system.peak_kw / 1_000,
+        base_bat_mwh           = bat_system.capacity_kwh / 1_000,
+        panel_spec             = panel_spec,
+        battery_spec           = battery_spec,
+        inverter_spec          = inverter_spec,
+        base_annual_energy_kwh = annual_del,
+    )
+    plot_sensitivity_results(pv_g, bat_g, lcoe_m, capex_m,
+                             pv_system.peak_kw / 1_000,
+                             bat_system.capacity_kwh / 1_000)
+
+    return df, summary, econ
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI entry-point
+# ──────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="MJ2438 – PV + Battery Subsystem Techno-Economic Analysis")
+    parser.add_argument("--pvgis", metavar="CSV", default=None,
+                        help="Path to PVGIS TMY CSV file for Seville "
+                             "(download from https://re.jrc.ec.europa.eu/pvg_tools/en/#TMY)")
+    args = parser.parse_args()
+    main(pvgis_path=args.pvgis)
