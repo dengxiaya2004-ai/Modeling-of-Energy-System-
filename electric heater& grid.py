@@ -1,41 +1,107 @@
+"""
+electric_heater_grid.py
+
+Reusable electric heater + grid backup module for hourly energy-system simulation.
+
+Assumptions
+-----------
+1. Time step = 1 hour
+   Therefore:
+   - MW over one time step is treated as MWh
+   - Cost = MW * (EUR/MWh) * 1h = EUR
+
+2. Timestep 0 corresponds to Monday 00:00
+
+3. Default demand generation:
+   - Weekdays: operate from 08:00 to 18:00 (10 hours)
+   - Weekends: no operation
+
+4. Default electricity price:
+   - Weekdays and weekends use different TOU tariffs
+
+5. Default PV profile:
+   - Simplified synthetic profile with daily solar shape
+   - Includes a simple seasonal factor
+"""
+
+from __future__ import annotations
+
 import math
 from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict, Any
+from typing import Sequence, Optional, Tuple, Dict, Any
 
 
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
 @dataclass
 class HeaterGridConfig:
     """Configuration for electric-heater + grid backup section."""
 
+    # Electric heater
     heater_p_max_mw: float = 10.0
     heater_efficiency: float = 0.99
+
+    # Grid
     grid_import_max_mw: float = float("inf")
 
+    # Operating schedule
     weekday_start_hour: int = 8
     weekday_end_hour: int = 18   # exclusive
+
     weekend_start_hour: int = 0
     weekend_end_hour: int = 0    # exclusive; 0->0 means no weekend operation
 
+    # Weekday TOU price
     weekday_peak_start_hour: int = 8
     weekday_peak_end_hour: int = 20
     weekday_peak_price_eur_per_mwh: float = 140.0
     weekday_offpeak_price_eur_per_mwh: float = 70.0
 
+    # Weekend TOU price
     weekend_peak_start_hour: int = 10
     weekend_peak_end_hour: int = 18
     weekend_peak_price_eur_per_mwh: float = 110.0
     weekend_offpeak_price_eur_per_mwh: float = 60.0
 
 
+# ============================================================
+# 2. COMPONENT MODELS
+# ============================================================
 class ElectricHeater:
     """Converts electricity (MW_el) into heat (MW_th)."""
 
     def __init__(self, p_max_mw: float, efficiency: float = 0.99):
+        if p_max_mw < 0:
+            raise ValueError("Electric heater max power must be non-negative.")
+        if not (0 < efficiency <= 1):
+            raise ValueError("Electric heater efficiency must be in (0, 1].")
+
         self.p_max_mw = p_max_mw
         self.efficiency = efficiency
 
     def dispatch(self, heat_demand_mw: float, available_power_mw: float) -> Tuple[float, float]:
+        """
+        Dispatch heater using available electricity.
+
+        Parameters
+        ----------
+        heat_demand_mw : float
+            Required heat [MW_th]
+        available_power_mw : float
+            Available electricity [MW_el]
+
+        Returns
+        -------
+        p_eh_mw : float
+            Electrical power used [MW_el]
+        q_eh_mw : float
+            Heat produced [MW_th]
+        """
+        heat_demand_mw = max(0.0, heat_demand_mw)
+        available_power_mw = max(0.0, available_power_mw)
+
         q_max_mw = self.p_max_mw * self.efficiency
         q_eh_mw = min(heat_demand_mw, q_max_mw)
         p_eh_mw = q_eh_mw / self.efficiency
@@ -50,21 +116,41 @@ class ElectricHeater:
 class Grid:
     """Grid model for import-limited electricity purchase."""
 
-    def __init__(self, price_import_eur_per_mwh: List[float], p_max_import_mw: float = float("inf")):
-        self.price_import_eur_per_mwh = price_import_eur_per_mwh
+    def __init__(self, price_import_eur_per_mwh: Sequence[float], p_max_import_mw: float = float("inf")):
+        if p_max_import_mw < 0:
+            raise ValueError("Grid import max power must be non-negative.")
+
+        self.price_import_eur_per_mwh = list(price_import_eur_per_mwh)
         self.p_max_import_mw = p_max_import_mw
 
     def import_power(self, demand_mw: float) -> float:
-        return min(demand_mw, self.p_max_import_mw)
+        """Return grid import power [MW]."""
+        return min(max(0.0, demand_mw), self.p_max_import_mw)
 
     def compute_cost(self, p_grid_mw: float, t: int) -> float:
-        return p_grid_mw * self.price_import_eur_per_mwh[t]
+        """
+        Compute hourly electricity import cost [EUR].
+
+        Assumes hourly timestep:
+        MW * (EUR/MWh) * 1h = EUR
+        """
+        return max(0.0, p_grid_mw) * self.price_import_eur_per_mwh[t]
 
 
-def build_is_weekend(time_steps: int, monday_as_day1: bool = True) -> List[bool]:
-    """Return a bool vector where weekend=True for Sat/Sun."""
+# ============================================================
+# 3. TIME / SCHEDULE HELPERS
+# ============================================================
+def build_is_weekend(time_steps: int, monday_as_day1: bool = True) -> list[bool]:
+    """
+    Return a boolean vector where weekend=True for Saturday/Sunday.
+
+    Assumes timestep 0 corresponds to Monday 00:00.
+    """
+    if time_steps <= 0:
+        raise ValueError("time_steps must be positive.")
+
     if not monday_as_day1:
-        raise NotImplementedError("Current implementation assumes day-1 is Monday.")
+        raise NotImplementedError("Current implementation assumes timestep 0 is Monday 00:00.")
 
     is_weekend = [False] * time_steps
     for t in range(time_steps):
@@ -74,8 +160,8 @@ def build_is_weekend(time_steps: int, monday_as_day1: bool = True) -> List[bool]
     return is_weekend
 
 
-def build_operating_schedule(time_steps: int, config: HeaterGridConfig) -> List[bool]:
-    """Operating hours mask with weekday/weekend distinction."""
+def build_operating_schedule(time_steps: int, config: HeaterGridConfig) -> list[bool]:
+    """Operating schedule with weekday/weekend distinction."""
     is_weekend = build_is_weekend(time_steps)
     schedule = [False] * time_steps
 
@@ -89,18 +175,36 @@ def build_operating_schedule(time_steps: int, config: HeaterGridConfig) -> List[
     return schedule
 
 
-def generate_heat_demand(time_steps: int, demand_mw: float, config: HeaterGridConfig) -> List[float]:
-    """Industrial heat demand with different weekday/weekend working windows."""
+# ============================================================
+# 4. PROFILE GENERATORS
+# ============================================================
+def generate_heat_demand(time_steps: int, demand_mw: float, config: HeaterGridConfig) -> list[float]:
+    """
+    Generate industrial heat demand [MW_th].
+
+    During scheduled operating hours:
+        heat_demand = demand_mw
+    Otherwise:
+        heat_demand = 0
+    """
+    if demand_mw < 0:
+        raise ValueError("Heat demand must be non-negative.")
+
     schedule = build_operating_schedule(time_steps, config)
     heat_demand = [0.0] * time_steps
+
     for t in range(time_steps):
         if schedule[t]:
             heat_demand[t] = demand_mw
+
     return heat_demand
 
 
-def generate_electricity_price(time_steps: int, config: HeaterGridConfig) -> List[float]:
-    """TOU electricity price with weekday/weekend differentiation."""
+def generate_electricity_price(time_steps: int, config: HeaterGridConfig) -> list[float]:
+    """
+    Generate hourly TOU electricity price [EUR/MWh]
+    with weekday/weekend differentiation.
+    """
     is_weekend = build_is_weekend(time_steps)
     price = [config.weekday_offpeak_price_eur_per_mwh] * time_steps
 
@@ -118,42 +222,90 @@ def generate_electricity_price(time_steps: int, config: HeaterGridConfig) -> Lis
     return price
 
 
-def generate_pv_profile(time_steps: int, peak_power_mw: float = 4.0) -> List[float]:
+def generate_pv_profile(time_steps: int, peak_power_mw: float = 4.0) -> list[float]:
+    """
+    Generate simplified hourly PV production [MW] on DC side.
+
+    Features:
+    - Daily solar production curve
+    - Simple seasonal factor
+    - No weather variability
+    """
+    if peak_power_mw < 0:
+        raise ValueError("PV peak power must be non-negative.")
+
     pv = [0.0] * time_steps
     for t in range(time_steps):
         hour = t % 24
-        pv[t] = peak_power_mw * max(0.0, math.sin(math.pi * (hour - 6) / 12))
+        day_of_year = (t // 24) % 365
+
+        # Daily daylight shape: sunrise ~6, sunset ~18
+        daily_shape = max(0.0, math.sin(math.pi * (hour - 6) / 12))
+
+        # Seasonal factor: slightly higher in summer, lower in winter
+        season_factor = 0.75 + 0.25 * math.sin(2 * math.pi * (day_of_year - 80) / 365)
+
+        pv[t] = peak_power_mw * season_factor * daily_shape
+
     return pv
 
 
+# ============================================================
+# 5. MAIN SIMULATION FUNCTION
+# ============================================================
 def simulate_electric_heater_grid_section(
-    heat_demand_mw: List[float],
-    pv_power_dc_mw: List[float],
-    electricity_price_eur_per_mwh: List[float],
+    heat_demand_mw: Sequence[float],
+    pv_power_dc_mw: Sequence[float],
+    electricity_price_eur_per_mwh: Sequence[float],
     config: HeaterGridConfig,
     inverter_efficiency: float = 0.97,
-    external_power_limit_mw: Optional[List[float]] = None,
-    generate_plots: bool = False,
-    output_dir: str = "output_plots",
-    file_prefix: str = "eh_grid",
+    external_power_limit_mw: Optional[Sequence[float]] = None,
 ) -> Dict[str, Any]:
     """
-    Reusable electric-heater + grid function for main simulation cascade.
+    Simulate electric heater + grid section over an hourly time series.
 
-    external_power_limit_mw: optional vector for other modules to cap available electric power.
+    Parameters
+    ----------
+    heat_demand_mw : Sequence[float]
+        Hourly heat demand [MW_th]
+    pv_power_dc_mw : Sequence[float]
+        Hourly PV production on DC side [MW]
+    electricity_price_eur_per_mwh : Sequence[float]
+        Hourly electricity price [EUR/MWh]
+    config : HeaterGridConfig
+        System configuration
+    inverter_efficiency : float
+        PV inverter efficiency [-]
+    external_power_limit_mw : Optional[Sequence[float]]
+        Optional external electric power cap [MW],
+        for integration with other modules
+
+    Returns
+    -------
+    results : dict
+        Detailed hourly and summary results
     """
+    if not (0 < inverter_efficiency <= 1):
+        raise ValueError("Inverter efficiency must be in (0, 1].")
+
+    heat_demand_mw = list(heat_demand_mw)
+    pv_power_dc_mw = list(pv_power_dc_mw)
+    electricity_price_eur_per_mwh = list(electricity_price_eur_per_mwh)
 
     time_steps = len(heat_demand_mw)
-    if len(pv_power_dc_mw) != time_steps or len(electricity_price_eur_per_mwh) != time_steps:
-        raise ValueError("heat demand, PV profile and price profile must have same length")
 
-    is_operating = build_operating_schedule(time_steps, config)
-    is_weekend = build_is_weekend(time_steps)
+    if len(pv_power_dc_mw) != time_steps or len(electricity_price_eur_per_mwh) != time_steps:
+        raise ValueError("heat demand, PV profile, and price profile must have the same length")
 
     if external_power_limit_mw is None:
         external_power_limit_mw = [float("inf")] * time_steps
-    elif len(external_power_limit_mw) != time_steps:
-        raise ValueError("external_power_limit_mw length must match heat demand")
+    else:
+        external_power_limit_mw = list(external_power_limit_mw)
+        if len(external_power_limit_mw) != time_steps:
+            raise ValueError("external_power_limit_mw length must match heat demand")
+
+    is_operating = build_operating_schedule(time_steps, config)
+    is_weekend = build_is_weekend(time_steps)
 
     heater = ElectricHeater(config.heater_p_max_mw, config.heater_efficiency)
     grid = Grid(electricity_price_eur_per_mwh, config.grid_import_max_mw)
@@ -163,19 +315,27 @@ def simulate_electric_heater_grid_section(
     p_grid_mw = [0.0] * time_steps
     cost_eur = [0.0] * time_steps
     q_residual_mw = [0.0] * time_steps
+    pv_power_ac_mw = [0.0] * time_steps
+    pv_used_mw = [0.0] * time_steps
+    pv_unused_mw = [0.0] * time_steps
 
     for t in range(time_steps):
-        demand_t = heat_demand_mw[t] if is_operating[t] else 0.0
-        pv_power_ac_t = pv_power_dc_mw[t] * inverter_efficiency
-        available_pv_t = min(pv_power_ac_t, external_power_limit_mw[t])
+        # Demand is assumed already prepared by upstream profile generation
+        demand_t = max(0.0, heat_demand_mw[t])
 
+        pv_power_ac_t = max(0.0, pv_power_dc_mw[t]) * inverter_efficiency
+        available_pv_t = min(pv_power_ac_t, max(0.0, external_power_limit_mw[t]))
+
+        # Step 1: use PV first
         p_eh_from_pv_t, q_eh_t = heater.dispatch(demand_t, available_pv_t)
 
+        # Step 2: use grid for remaining heat demand
         remaining_heat = demand_t - q_eh_t
         if remaining_heat > 0:
             p_needed_grid_t = remaining_heat / heater.efficiency
             p_grid_t = grid.import_power(p_needed_grid_t)
             q_extra = p_grid_t * heater.efficiency
+
             q_eh_t += q_extra
             p_eh_t = p_eh_from_pv_t + p_grid_t
         else:
@@ -186,35 +346,58 @@ def simulate_electric_heater_grid_section(
         q_eh_mw[t] = q_eh_t
         p_grid_mw[t] = p_grid_t
         cost_eur[t] = grid.compute_cost(p_grid_t, t)
-        q_residual_mw[t] = max(heat_demand_mw[t] - q_eh_t, 0.0)
+        q_residual_mw[t] = max(demand_t - q_eh_t, 0.0)
+
+        pv_power_ac_mw[t] = pv_power_ac_t
+        pv_used_mw[t] = p_eh_from_pv_t
+        pv_unused_mw[t] = max(0.0, available_pv_t - p_eh_from_pv_t)
 
     results = {
+        # Hourly results
         "P_EH_MW": p_eh_total_mw,
         "Q_EH_MW": q_eh_mw,
         "P_grid_MW": p_grid_mw,
         "cost_EUR": cost_eur,
         "Q_residual_MW": q_residual_mw,
+        "PV_power_AC_MW": pv_power_ac_mw,
+        "PV_used_MW": pv_used_mw,
+        "PV_unused_MW": pv_unused_mw,
         "is_operating": is_operating,
         "is_weekend": is_weekend,
         "electricity_price_EUR_per_MWh": electricity_price_eur_per_mwh,
-        "total_cost_EUR": sum(cost_eur),
-    }
 
-    if generate_plots:
-        results["plot_files"] = _generate_summary_plots(results, output_dir, file_prefix)
+        # Summary results
+        "total_cost_EUR": sum(cost_eur),
+        "total_grid_import_MWh": sum(p_grid_mw),
+        "total_heat_from_EH_MWh": sum(q_eh_mw),
+        "total_unserved_heat_MWh": sum(q_residual_mw),
+        "total_pv_used_MWh": sum(pv_used_mw),
+        "avg_grid_import_MW": sum(p_grid_mw) / time_steps,
+    }
 
     return results
 
 
-def _generate_summary_plots(results: Dict[str, Any], output_dir: str, file_prefix: str) -> Dict[str, str]:
+# ============================================================
+# 6. PLOTTING FUNCTIONS (SEPARATE FROM SIMULATION)
+# ============================================================
+def generate_summary_plots(
+    results: Dict[str, Any],
+    output_dir: str | Path = "output_plots",
+    file_prefix: str = "eh_grid",
+) -> Dict[str, str]:
     """
-    Generate:
-      1) Daily power chart (24h)
-      2) Annual weekly-view heatmap
-      3) Monthly cost bar chart
+    Generate summary plots.
+
+    For non-8760 data, monthly cost will be skipped.
     """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        return _generate_summary_svgs(results, out, file_prefix)
 
     p_grid = results["P_grid_MW"]
     q_eh = results["Q_EH_MW"]
@@ -222,31 +405,29 @@ def _generate_summary_plots(results: Dict[str, Any], output_dir: str, file_prefi
     is_operating = results["is_operating"]
     n = len(p_grid)
 
-    # Fallback to pure-SVG output when matplotlib is unavailable.
-    try:
-        import matplotlib.pyplot as plt
-    except Exception:
-        return _generate_summary_svgs(results, out, file_prefix)
+    files = {}
 
-    # 1) Daily power chart: first 24 hours (matplotlib)
-    h = list(range(24))
-    p_day = p_grid[:24]
-    q_day = q_eh[:24]
+    # --------------------------------------------------------
+    # Plot 1: Daily power chart (first 24h)
+    # --------------------------------------------------------
+    hours = list(range(min(24, n)))
     fig1 = plt.figure(figsize=(10, 4.5))
-    plt.plot(h, q_day, label="Q_EH_MW (Heat)", color="#D1495B", linewidth=2)
-    plt.plot(h, p_day, label="P_grid_MW (Grid)", color="#2E86AB", linewidth=2)
-    plt.title("Daily Power Profile (First 24h)")
+    plt.plot(hours, q_eh[:len(hours)], label="Q_EH_MW (Heat)", linewidth=2)
+    plt.plot(hours, p_grid[:len(hours)], label="P_grid_MW (Grid)", linewidth=2)
+    plt.title("Daily Power Profile")
     plt.xlabel("Hour of Day")
     plt.ylabel("Power [MW]")
-    plt.xticks(range(0, 24, 2))
     plt.grid(alpha=0.25)
     plt.legend()
     daily_path = out / f"{file_prefix}_daily_power.png"
     fig1.tight_layout()
     fig1.savefig(daily_path, dpi=140)
     plt.close(fig1)
+    files["daily_power"] = str(daily_path)
 
-    # 2) Annual weekly-view heatmap: weeks x 168h operating status
+    # --------------------------------------------------------
+    # Plot 2: Weekly-view heatmap
+    # --------------------------------------------------------
     hours_per_week = 168
     weeks = (n + hours_per_week - 1) // hours_per_week
     heatmap = [[0.0 for _ in range(hours_per_week)] for _ in range(weeks)]
@@ -257,47 +438,49 @@ def _generate_summary_plots(results: Dict[str, Any], output_dir: str, file_prefi
 
     fig2 = plt.figure(figsize=(12, 5))
     plt.imshow(heatmap, aspect="auto", interpolation="nearest", cmap="YlGnBu", vmin=0, vmax=1)
-    plt.title("Annual Weekly View (Operating Status)")
+    plt.title("Weekly Operating Status View")
     plt.xlabel("Hour in Week (0-167)")
     plt.ylabel("Week Index")
     cbar = plt.colorbar()
     cbar.set_label("Operating (1) / Off (0)")
-    weekly_path = out / f"{file_prefix}_annual_weekly_view.png"
+    weekly_path = out / f"{file_prefix}_weekly_view.png"
     fig2.tight_layout()
     fig2.savefig(weekly_path, dpi=140)
     plt.close(fig2)
+    files["weekly_view"] = str(weekly_path)
 
-    # 3) Monthly cost bar chart
-    days_per_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-    monthly_cost = [0.0] * 12
-    idx = 0
-    for m, d in enumerate(days_per_month):
-        h_month = d * 24
-        monthly_cost[m] = sum(cost[idx:idx + h_month])
-        idx += h_month
+    # --------------------------------------------------------
+    # Plot 3: Monthly cost (only for 8760h non-leap year)
+    # --------------------------------------------------------
+    if n == 8760:
+        days_per_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        monthly_cost = [0.0] * 12
 
-    fig3 = plt.figure(figsize=(10, 4.8))
-    plt.bar(month_names, monthly_cost, color="#4C956C")
-    plt.title("Monthly Grid Electricity Cost")
-    plt.xlabel("Month")
-    plt.ylabel("Cost [EUR]")
-    plt.grid(axis="y", alpha=0.25)
-    monthly_path = out / f"{file_prefix}_monthly_cost.png"
-    fig3.tight_layout()
-    fig3.savefig(monthly_path, dpi=140)
-    plt.close(fig3)
+        idx = 0
+        for m, d in enumerate(days_per_month):
+            h_month = d * 24
+            monthly_cost[m] = sum(cost[idx:idx + h_month])
+            idx += h_month
 
-    return {
-        "daily_power": str(daily_path),
-        "annual_weekly_view": str(weekly_path),
-        "monthly_cost": str(monthly_path),
-    }
+        fig3 = plt.figure(figsize=(10, 4.8))
+        plt.bar(month_names, monthly_cost)
+        plt.title("Monthly Grid Electricity Cost")
+        plt.xlabel("Month")
+        plt.ylabel("Cost [EUR]")
+        plt.grid(axis="y", alpha=0.25)
+        monthly_path = out / f"{file_prefix}_monthly_cost.png"
+        fig3.tight_layout()
+        fig3.savefig(monthly_path, dpi=140)
+        plt.close(fig3)
+        files["monthly_cost"] = str(monthly_path)
+
+    return files
 
 
 def _generate_summary_svgs(results: Dict[str, Any], out: Path, file_prefix: str) -> Dict[str, str]:
-    """Dependency-free SVG fallback output for the three required charts."""
+    """Dependency-free SVG fallback output."""
     p_grid = results["P_grid_MW"]
     q_eh = results["Q_EH_MW"]
     cost = results["cost_EUR"]
@@ -305,37 +488,42 @@ def _generate_summary_svgs(results: Dict[str, Any], out: Path, file_prefix: str)
     n = len(p_grid)
 
     daily_path = out / f"{file_prefix}_daily_power.svg"
-    weekly_path = out / f"{file_prefix}_annual_weekly_view.svg"
-    monthly_path = out / f"{file_prefix}_monthly_cost.svg"
+    weekly_path = out / f"{file_prefix}_weekly_view.svg"
 
     _write_daily_power_svg(daily_path, q_eh[:24], p_grid[:24])
-    _write_annual_weekly_svg(weekly_path, is_operating, n)
-    _write_monthly_cost_svg(monthly_path, cost)
+    _write_weekly_view_svg(weekly_path, is_operating, n)
 
-    return {
+    files = {
         "daily_power": str(daily_path),
-        "annual_weekly_view": str(weekly_path),
-        "monthly_cost": str(monthly_path),
+        "weekly_view": str(weekly_path),
     }
 
+    if n == 8760:
+        monthly_path = out / f"{file_prefix}_monthly_cost.svg"
+        _write_monthly_cost_svg(monthly_path, cost)
+        files["monthly_cost"] = str(monthly_path)
 
-def _write_daily_power_svg(path: Path, q_day: List[float], p_day: List[float]) -> None:
+    return files
+
+
+def _write_daily_power_svg(path: Path, q_day: Sequence[float], p_day: Sequence[float]) -> None:
     w, h = 960, 360
     margin = 50
     plot_w, plot_h = w - 2 * margin, h - 2 * margin
     ymax = max(max(q_day) if q_day else 0.0, max(p_day) if p_day else 0.0, 1.0)
 
-    def points(vals):
+    def points(vals: Sequence[float]) -> str:
         pts = []
+        n = max(1, len(vals) - 1)
         for i, v in enumerate(vals):
-            x = margin + (i / 23) * plot_w if len(vals) > 1 else margin
+            x = margin + (i / n) * plot_w
             y = margin + plot_h - (v / ymax) * plot_h
             pts.append(f"{x:.1f},{y:.1f}")
         return " ".join(pts)
 
     svg = f"""<svg xmlns='http://www.w3.org/2000/svg' width='{w}' height='{h}'>
 <rect width='100%' height='100%' fill='white'/>
-<text x='{w/2}' y='28' text-anchor='middle' font-size='18'>Daily Power Profile (First 24h)</text>
+<text x='{w/2}' y='28' text-anchor='middle' font-size='18'>Daily Power Profile</text>
 <line x1='{margin}' y1='{margin+plot_h}' x2='{w-margin}' y2='{margin+plot_h}' stroke='black'/>
 <line x1='{margin}' y1='{margin}' x2='{margin}' y2='{margin+plot_h}' stroke='black'/>
 <polyline points='{points(q_day)}' fill='none' stroke='#D1495B' stroke-width='2.5'/>
@@ -346,7 +534,7 @@ def _write_daily_power_svg(path: Path, q_day: List[float], p_day: List[float]) -
     path.write_text(svg, encoding="utf-8")
 
 
-def _write_annual_weekly_svg(path: Path, is_operating: List[bool], n: int) -> None:
+def _write_weekly_view_svg(path: Path, is_operating: Sequence[bool], n: int) -> None:
     hours_per_week = 168
     weeks = (n + hours_per_week - 1) // hours_per_week
     cell_w, cell_h = 4, 10
@@ -365,7 +553,7 @@ def _write_annual_weekly_svg(path: Path, is_operating: List[bool], n: int) -> No
 
     svg = f"""<svg xmlns='http://www.w3.org/2000/svg' width='{w}' height='{h}'>
 <rect width='100%' height='100%' fill='white'/>
-<text x='{w/2}' y='24' text-anchor='middle' font-size='18'>Annual Weekly View (Operating Status)</text>
+<text x='{w/2}' y='24' text-anchor='middle' font-size='18'>Weekly Operating Status View</text>
 <text x='10' y='{margin_y+15}' font-size='12'>Week</text>
 <text x='{margin_x}' y='{h-8}' font-size='12'>Hour in Week (0-167)</text>
 {''.join(rects)}
@@ -373,7 +561,7 @@ def _write_annual_weekly_svg(path: Path, is_operating: List[bool], n: int) -> No
     path.write_text(svg, encoding="utf-8")
 
 
-def _write_monthly_cost_svg(path: Path, cost: List[float]) -> None:
+def _write_monthly_cost_svg(path: Path, cost: Sequence[float]) -> None:
     days_per_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -412,28 +600,43 @@ def _write_monthly_cost_svg(path: Path, cost: List[float]) -> None:
     path.write_text(svg, encoding="utf-8")
 
 
+# ============================================================
+# 7. TEST / DEMO
+# ============================================================
 if __name__ == "__main__":
     cfg = HeaterGridConfig()
     n = 8760
 
+    # Generate input profiles
     heat = generate_heat_demand(time_steps=n, demand_mw=10.0, config=cfg)
     price = generate_electricity_price(time_steps=n, config=cfg)
     pv = generate_pv_profile(time_steps=n, peak_power_mw=4.0)
 
+    # Run simulation
     result = simulate_electric_heater_grid_section(
         heat_demand_mw=heat,
         pv_power_dc_mw=pv,
         electricity_price_eur_per_mwh=price,
         config=cfg,
-        generate_plots=True,
+        inverter_efficiency=0.97,
+    )
+
+    # Generate plots separately
+    plot_files = generate_summary_plots(
+        result,
         output_dir="output_plots",
         file_prefix="eh_grid",
     )
 
-    avg_grid = sum(result["P_grid_MW"]) / len(result["P_grid_MW"]) if result["P_grid_MW"] else 0.0
+    # Print summary
+    print("=== Electric Heater + Grid Section Test ===")
     print(f"Total yearly grid cost (EUR): {result['total_cost_EUR']:.2f}")
-    print(f"Average grid import (MW): {avg_grid:.3f}")
-    if "plot_files" in result:
-        print("Generated plots:")
-        for k, v in result["plot_files"].items():
-            print(f"  - {k}: {v}")
+    print(f"Average grid import (MW): {result['avg_grid_import_MW']:.3f}")
+    print(f"Total grid import (MWh): {result['total_grid_import_MWh']:.2f}")
+    print(f"Total heat from EH (MWh): {result['total_heat_from_EH_MWh']:.2f}")
+    print(f"Total unserved heat (MWh): {result['total_unserved_heat_MWh']:.2f}")
+    print(f"Total PV used by EH (MWh): {result['total_pv_used_MWh']:.2f}")
+
+    print("\nGenerated plots:")
+    for key, value in plot_files.items():
+        print(f"  - {key}: {value}")
